@@ -10,7 +10,7 @@ const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
 // Hardcode your Gemini API Key from environment variables
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+const GEMINI_API_KEY = 'AIzaSyC3YF_vrVCB7WsXwfRd0a6UaBtcW2dq1NY';
 
 // HARDCODED RECOMMENDED MODEL FOR LIVE API
 // This model is specifically designed for Live API audio interactions.
@@ -175,7 +175,7 @@ wss.on('connection', ws => {
     };
 });
 
-const PORT = process.env.PORT || 3014;
+const PORT = process.env.PORT || 3015;
 server.listen(PORT, () => {
     console.log(`Server listening on http://localhost:${PORT}`);
     console.log(`WebSocket server listening on ws://localhost:${PORT}`);
