@@ -10,7 +10,7 @@ const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
 // Hardcode your Gemini API Key from environment variables
-const GEMINI_API_KEY = 'AIzaSyC3YF_vrVCB7WsXwfRd0a6UaBtcW2dq1NY';
+const GEMINI_API_KEY = 'AIzaSyAUNsy6b1FjXGxnzPIv2kXTVoOB-qkTvSg';
 
 // HARDCODED RECOMMENDED MODEL FOR LIVE API
 // This model is specifically designed for Live API audio interactions.
