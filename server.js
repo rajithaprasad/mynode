@@ -6,9 +6,9 @@ const http = require('http');
 const db = mysql.createPool({
     host: 'srv657.hstgr.io',
     port: 3306,
-    user: 'your_db_user',
-    password: 'your_db_password',
-    database: 'your_db_name',
+    user: 'u442108067_rajithawalpola',
+    password: '12IEhou:P',
+    database: 'u442108067_testdb',
     waitForConnections: true,
     connectionLimit: 10,
     queueLimit: 0
