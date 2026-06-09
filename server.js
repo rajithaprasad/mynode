@@ -17,7 +17,7 @@ const db = mysql.createPool({
 const server = http.createServer();
 const wss = new WebSocket.Server({ server });
 
-// Store connected clients and their subscriptions s
+// Store connected clients and their subscriptions ss
 const clients = new Map(); // driverId -> { ws, type }
 const passengerClients = new Set();
 
