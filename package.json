@@ -1,15 +1,13 @@
 {
-  "name": "gemini-voice-assistant",
+  "name": "dropme-websocket",
   "version": "1.0.0",
-  "description": "Live streaming voice assistant with Node.js and Gemini API",
+  "description": "WebSocket server for DropMe real-time tracking",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
   "dependencies": {
-    "@google/generative-ai": "^0.1.0",
-    "dotenv": "^16.0.3",
-    "express": "^4.18.2",
-    "ws": "^8.13.0"
+    "ws": "^8.14.2",
+    "mysql2": "^3.6.0"
   }
 }
