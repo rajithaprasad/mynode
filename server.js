@@ -60,7 +60,6 @@ async function getNearbyDrivers(latitude, longitude, radius = 10) {
     }
 }
 
-// Store connected clients
 const clients = new Map();
 const passengerWsMap = new Map();
 
@@ -260,15 +259,21 @@ wss.on('connection', (ws, req) => {
                 case 'passenger_accept_bid':
                     console.log(`✅ Passenger accepted bid from driver ${data.driver_id} for ₹${data.bid_amount}`);
                     
+                    // Update bid status
                     await db.promise().execute(`UPDATE driver_bids SET status = 'accepted' WHERE ride_request_id = ? AND driver_id = ?`, [data.ride_request_id, data.driver_id]);
+                    await db.promise().execute(`UPDATE driver_bids SET status = 'declined' WHERE ride_request_id = ? AND driver_id != ?`, [data.ride_request_id, data.driver_id]);
+                    
+                    // Update ride request
                     await db.promise().execute(`UPDATE ride_requests SET status = 'accepted', driver_id = ? WHERE id = ?`, [data.driver_id, data.ride_request_id]);
                     
+                    // Get ride details
                     const [rideDetails] = await db.promise().execute(
                         `SELECT passenger_id, pickup_lat, pickup_lng, pickup_address, dropoff_lat, dropoff_lng, dropoff_address FROM ride_requests WHERE id = ?`,
                         [data.ride_request_id]
                     );
                     const ride = rideDetails[0];
                     
+                    // Insert into active_rides
                     await db.promise().execute(
                         `INSERT INTO active_rides (ride_request_id, passenger_id, driver_id, bid_amount, status, 
                             pickup_lat, pickup_lng, pickup_address, dropoff_lat, dropoff_lng, dropoff_address)
@@ -278,7 +283,7 @@ wss.on('connection', (ws, req) => {
                          ride.dropoff_lat, ride.dropoff_lng, ride.dropoff_address]
                     );
                     
-                    // Send to driver - THIS IS CRITICAL
+                    // Send to driver
                     const driverSent = sendToDriver(data.driver_id, {
                         type: 'ride_assigned',
                         ride: {
@@ -296,6 +301,7 @@ wss.on('connection', (ws, req) => {
                     
                     console.log(`Driver send result: ${driverSent}`);
                     
+                    // Send to passenger
                     sendToPassenger(data.passenger_id, {
                         type: 'ride_confirmed',
                         driver_id: data.driver_id,
