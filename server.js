@@ -66,10 +66,9 @@ async function getNearbyDrivers(latitude, longitude, radius = 10) {
 // Store connected clients
 const clients = new Map(); // driver_id -> { ws, type }
 const passengerWsMap = new Map(); // passenger_id -> ws
-const allConnections = new Set(); // All WebSocket connections for debugging
+const allConnections = new Set();
 
 console.log('WebSocket server starting...');
-console.log('Available driver IDs will be stored in clients map');
 
 // Test database connection
 db.getConnection((err, connection) => {
@@ -81,19 +80,17 @@ db.getConnection((err, connection) => {
     }
 });
 
-// Create HTTP server for health checks
+// Create HTTP server
 const server = http.createServer((req, res) => {
     if (req.url === '/healthz') {
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ status: 'ok', timestamp: new Date().toISOString() }));
     } else if (req.url === '/clients') {
-        // Debug endpoint to see connected clients
         const driverIds = Array.from(clients.keys());
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ 
             drivers: driverIds,
-            passengerCount: passengerWsMap.size,
-            totalConnections: allConnections.size
+            passengerCount: passengerWsMap.size
         }));
     } else {
         res.writeHead(404);
@@ -101,7 +98,6 @@ const server = http.createServer((req, res) => {
     }
 });
 
-// Create WebSocket server
 const wss = new WebSocket.Server({ server });
 
 wss.on('connection', (ws, req) => {
@@ -123,7 +119,7 @@ wss.on('connection', (ws, req) => {
                     clients.set(data.driver_id, { ws, type: 'driver', driverId: data.driver_id });
                     ws.send(JSON.stringify({ type: 'auth_success', role: 'driver' }));
                     console.log(`✅ Driver ${data.driver_id} authenticated`);
-                    console.log(`📋 Current drivers in map: ${Array.from(clients.keys()).join(', ')}`);
+                    console.log(`📋 Current drivers: ${Array.from(clients.keys()).join(', ')}`);
                     break;
                     
                 // ============ DRIVER LOCATION ============
@@ -218,7 +214,6 @@ wss.on('connection', (ws, req) => {
                     console.log(`🚗 Passenger requesting ride from driver ${data.driver_id}`);
                     console.log(`📋 Available drivers: ${Array.from(clients.keys()).join(', ')}`);
                     
-                    // Check if driver exists in clients map
                     const targetDriver = clients.get(data.driver_id);
                     if (!targetDriver) {
                         console.log(`❌ Driver ${data.driver_id} not found in clients map!`);
@@ -231,19 +226,18 @@ wss.on('connection', (ws, req) => {
                     
                     console.log(`✅ Driver ${data.driver_id} found, sending request...`);
                     
-                    // Calculate distance between pickup and dropoff
                     const distance = calculateDistance(
                         data.pickup_lat, data.pickup_lng,
                         data.dropoff_lat, data.dropoff_lng
                     );
                     
-                    // Save ride request to database
+                    // Save ride request to database - without distance column
                     const insertRide = `
                         INSERT INTO ride_requests (
                             passenger_id, driver_id, pickup_lat, pickup_lng, pickup_address, 
-                            dropoff_lat, dropoff_lng, dropoff_address, status, distance,
+                            dropoff_lat, dropoff_lng, dropoff_address, status,
                             passenger_name, passenger_phone
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
                     `;
                     
                     const [result] = await db.promise().execute(insertRide, [
@@ -251,14 +245,12 @@ wss.on('connection', (ws, req) => {
                         data.driver_id,
                         data.pickup_lat, data.pickup_lng, data.pickup_address || '',
                         data.dropoff_lat, data.dropoff_lng, data.dropoff_address || '',
-                        distance.toFixed(2),
                         data.passenger_name || 'Guest',
                         data.passenger_phone || ''
                     ]);
                     
                     const rideRequestId = result.insertId;
                     
-                    // Send request to the selected driver
                     const driverWs = targetDriver.ws;
                     if (driverWs && driverWs.readyState === WebSocket.OPEN) {
                         driverWs.send(JSON.stringify({
@@ -308,7 +300,6 @@ wss.on('connection', (ws, req) => {
                     const [driverInfo] = await db.promise().execute('SELECT name FROM users WHERE id = ?', [data.driver_id]);
                     const driverName = driverInfo[0]?.name || 'Driver';
                     
-                    // Find passenger by ride request
                     const [rideInfo] = await db.promise().execute('SELECT passenger_id FROM ride_requests WHERE id = ?', [data.ride_request_id]);
                     const passengerId = rideInfo[0]?.passenger_id || 1;
                     
