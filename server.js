@@ -17,20 +17,49 @@ const db = mysql.createPool({
     keepAliveInitialDelay: 0
 });
 
+// Helper function to get nearby drivers
+async function getNearbyDrivers(latitude, longitude, radius = 10) {
+    const query = `
+        SELECT 
+            d.driver_id,
+            d.driver_type,
+            d.latitude,
+            d.longitude,
+            d.heading,
+            d.speed,
+            d.last_update,
+            u.name as driver_name,
+            u.profile_image,
+            (6371 * acos(cos(radians(?)) * cos(radians(d.latitude)) * 
+            cos(radians(d.longitude) - radians(?)) + 
+            sin(radians(?)) * sin(radians(d.latitude)))) AS distance
+        FROM driver_locations d
+        LEFT JOIN users u ON d.driver_id = u.id
+        WHERE d.is_online = 1 
+            AND d.last_update > DATE_SUB(NOW(), INTERVAL 2 MINUTE)
+        HAVING distance < ?
+        ORDER BY distance ASC
+        LIMIT 200
+    `;
+    
+    try {
+        const [drivers] = await db.promise().execute(query, [latitude, longitude, latitude, longitude, radius]);
+        return drivers;
+    } catch (error) {
+        console.error('Error getting nearby drivers:', error);
+        return [];
+    }
+}
+
 // Test database connection on startup
 db.getConnection((err, connection) => {
     if (err) {
         console.error('❌ DATABASE CONNECTION FAILED:', err.message);
         console.error('Error code:', err.code);
-        console.error('Check:');
-        console.error('1. Remote MySQL is enabled in cPanel');
-        console.error('2. User has proper privileges');
-        console.error('3. Password is correct');
     } else {
         console.log('✅ Database connected successfully!');
         connection.release();
         
-        // Test the driver_locations table
         connection.query('SELECT COUNT(*) as count FROM driver_locations', (err, results) => {
             if (err) {
                 console.error('❌ Table check failed:', err.message);
@@ -47,7 +76,6 @@ const server = http.createServer((req, res) => {
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ status: 'ok', timestamp: new Date().toISOString() }));
     } else if (req.url === '/db-test') {
-        // Test database endpoint
         db.query('SELECT 1 as test, NOW() as time', (err, results) => {
             if (err) {
                 res.writeHead(500, { 'Content-Type': 'application/json' });
@@ -105,7 +133,7 @@ wss.on('connection', (ws, req) => {
                     `;
                     
                     try {
-                        const [result] = await db.promise().execute(query, [
+                        await db.promise().execute(query, [
                             data.driver_id, 
                             data.driver_type || 'bike', 
                             data.latitude, 
@@ -117,24 +145,39 @@ wss.on('connection', (ws, req) => {
                         ]);
                         console.log(`✅ Database updated for driver ${data.driver_id}`);
                         
-                        // Broadcast to passengers
+                        // Get driver name for broadcast
+                        let driverName = 'Driver';
+                        try {
+                            const [userResult] = await db.promise().execute('SELECT name FROM users WHERE id = ?', [data.driver_id]);
+                            if (userResult.length > 0 && userResult[0].name) {
+                                driverName = userResult[0].name;
+                            }
+                        } catch (nameErr) {
+                            console.log('Could not fetch driver name');
+                        }
+                        
+                        // Broadcast to all passengers
+                        const broadcastData = {
+                            type: 'driver_location_update',
+                            driver: {
+                                driver_id: data.driver_id,
+                                driver_name: driverName,
+                                driver_type: data.driver_type || 'bike',
+                                latitude: data.latitude,
+                                longitude: data.longitude,
+                                heading: data.heading || 0,
+                                speed: data.speed || 0,
+                                last_update: now.toISOString()
+                            }
+                        };
+                        
                         passengerClients.forEach(client => {
                             if (client.readyState === WebSocket.OPEN) {
-                                client.send(JSON.stringify({
-                                    type: 'driver_location_update',
-                                    driver: {
-                                        id: data.driver_id,
-                                        type: data.driver_type,
-                                        latitude: data.latitude,
-                                        longitude: data.longitude,
-                                        heading: data.heading
-                                    }
-                                }));
+                                client.send(JSON.stringify(broadcastData));
                             }
                         });
                     } catch (dbError) {
                         console.error('❌ Database error:', dbError.message);
-                        console.error('SQL:', query);
                         ws.send(JSON.stringify({ type: 'db_error', message: dbError.message }));
                     }
                     break;
@@ -143,15 +186,51 @@ wss.on('connection', (ws, req) => {
                     passengerClients.add(ws);
                     ws.send(JSON.stringify({ type: 'auth_success', role: 'passenger' }));
                     console.log('✅ Passenger authenticated');
+                    
+                    // Send initial nearby drivers if location provided
+                    if (data.latitude && data.longitude) {
+                        console.log(`📍 Passenger location: ${data.latitude}, ${data.longitude}`);
+                        const drivers = await getNearbyDrivers(data.latitude, data.longitude);
+                        console.log(`📊 Sending ${drivers.length} nearby drivers to passenger`);
+                        ws.send(JSON.stringify({
+                            type: 'initial_drivers',
+                            drivers: drivers
+                        }));
+                    }
+                    break;
+                    
+                case 'passenger_location':
+                    // Update passenger location and send nearby drivers
+                    if (data.latitude && data.longitude) {
+                        const nearbyDrivers = await getNearbyDrivers(data.latitude, data.longitude);
+                        ws.send(JSON.stringify({
+                            type: 'initial_drivers',
+                            drivers: nearbyDrivers
+                        }));
+                    }
                     break;
                     
                 case 'driver_offline':
                     try {
                         await db.promise().execute('UPDATE driver_locations SET is_online = 0 WHERE driver_id = ?', [data.driver_id]);
                         console.log(`✅ Driver ${data.driver_id} went offline`);
+                        
+                        // Broadcast to passengers that driver went offline
+                        passengerClients.forEach(client => {
+                            if (client.readyState === WebSocket.OPEN) {
+                                client.send(JSON.stringify({
+                                    type: 'driver_offline',
+                                    driver_id: data.driver_id
+                                }));
+                            }
+                        });
                     } catch (err) {
                         console.error('Offline update error:', err.message);
                     }
+                    break;
+                    
+                case 'ping':
+                    ws.send(JSON.stringify({ type: 'pong', timestamp: Date.now() }));
                     break;
                     
                 default:
@@ -193,6 +272,20 @@ setInterval(async () => {
         console.error('Cleanup error:', error);
     }
 }, 60000);
+
+// Also clean up old records from otp_codes table (optional)
+setInterval(async () => {
+    try {
+        const [result] = await db.promise().execute(`
+            DELETE FROM otp_codes WHERE expires_at < NOW()
+        `);
+        if (result.affectedRows > 0) {
+            console.log(`🧹 Cleaned up ${result.affectedRows} expired OTPs`);
+        }
+    } catch (error) {
+        console.error('OTP cleanup error:', error);
+    }
+}, 3600000); // Every hour
 
 const PORT = process.env.PORT || 8080;
 server.listen(PORT, '0.0.0.0', () => {
