@@ -51,11 +51,38 @@ async function getNearbyDrivers(latitude, longitude, radius = 10) {
     }
 }
 
+// Helper function to send notification to specific driver
+function sendToDriver(driverId, data) {
+    const client = clients.get(driverId);
+    if (client && client.ws && client.ws.readyState === WebSocket.OPEN) {
+        client.ws.send(JSON.stringify(data));
+        return true;
+    }
+    return false;
+}
+
+// Helper function to send notification to specific passenger
+function sendToPassenger(ws, data) {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify(data));
+        return true;
+    }
+    return false;
+}
+
+// Helper function to broadcast to all passengers
+function broadcastToPassengers(data) {
+    passengerClients.forEach(client => {
+        if (client.readyState === WebSocket.OPEN) {
+            client.send(JSON.stringify(data));
+        }
+    });
+}
+
 // Test database connection on startup
 db.getConnection((err, connection) => {
     if (err) {
         console.error('❌ DATABASE CONNECTION FAILED:', err.message);
-        console.error('Error code:', err.code);
     } else {
         console.log('✅ Database connected successfully!');
         connection.release();
@@ -75,16 +102,6 @@ const server = http.createServer((req, res) => {
     if (req.url === '/healthz') {
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ status: 'ok', timestamp: new Date().toISOString() }));
-    } else if (req.url === '/db-test') {
-        db.query('SELECT 1 as test, NOW() as time', (err, results) => {
-            if (err) {
-                res.writeHead(500, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ success: false, error: err.message }));
-            } else {
-                res.writeHead(200, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ success: true, message: 'Database connected', time: results[0].time }));
-            }
-        });
     } else {
         res.writeHead(404);
         res.end();
@@ -95,13 +112,14 @@ const server = http.createServer((req, res) => {
 const wss = new WebSocket.Server({ server });
 
 // Store connected clients
-const clients = new Map();
-const passengerClients = new Set();
+const clients = new Map(); // driver_id -> { ws, type }
+const passengerClients = new Set(); // set of passenger WebSocket connections
 
 console.log('WebSocket server starting...');
 
 wss.on('connection', (ws, req) => {
     console.log('New client connected');
+    let currentPassengerId = null;
     
     ws.on('message', async (message) => {
         try {
@@ -109,15 +127,15 @@ wss.on('connection', (ws, req) => {
             console.log('Received:', data.type, data.driver_id ? `Driver: ${data.driver_id}` : '');
             
             switch (data.type) {
+                // ============ DRIVER AUTH ============
                 case 'driver_auth':
                     clients.set(data.driver_id, { ws, type: 'driver', driverId: data.driver_id });
                     ws.send(JSON.stringify({ type: 'auth_success', role: 'driver' }));
                     console.log(`✅ Driver ${data.driver_id} authenticated`);
                     break;
                     
+                // ============ DRIVER LOCATION ============
                 case 'driver_location':
-                    console.log(`📍 Location update for driver ${data.driver_id}: ${data.latitude}, ${data.longitude}`);
-                    
                     const now = new Date();
                     const query = `
                         INSERT INTO driver_locations (driver_id, driver_type, latitude, longitude, heading, speed, is_online, last_update) 
@@ -135,7 +153,7 @@ wss.on('connection', (ws, req) => {
                     try {
                         await db.promise().execute(query, [
                             data.driver_id, 
-                            data.driver_type || 'bike', 
+                            data.driver_type || 'car', 
                             data.latitude, 
                             data.longitude, 
                             data.heading || 0, 
@@ -143,55 +161,44 @@ wss.on('connection', (ws, req) => {
                             data.is_online ? 1 : 0, 
                             now
                         ]);
-                        console.log(`✅ Database updated for driver ${data.driver_id}`);
                         
-                        // Get driver name for broadcast
+                        // Get driver name
                         let driverName = 'Driver';
                         try {
                             const [userResult] = await db.promise().execute('SELECT name FROM users WHERE id = ?', [data.driver_id]);
                             if (userResult.length > 0 && userResult[0].name) {
                                 driverName = userResult[0].name;
                             }
-                        } catch (nameErr) {
-                            console.log('Could not fetch driver name');
-                        }
+                        } catch (nameErr) {}
                         
-                        // Broadcast to all passengers
-                        const broadcastData = {
+                        // Broadcast to passengers
+                        broadcastToPassengers({
                             type: 'driver_location_update',
                             driver: {
                                 driver_id: data.driver_id,
                                 driver_name: driverName,
-                                driver_type: data.driver_type || 'bike',
+                                driver_type: data.driver_type || 'car',
                                 latitude: data.latitude,
                                 longitude: data.longitude,
                                 heading: data.heading || 0,
                                 speed: data.speed || 0,
                                 last_update: now.toISOString()
                             }
-                        };
-                        
-                        passengerClients.forEach(client => {
-                            if (client.readyState === WebSocket.OPEN) {
-                                client.send(JSON.stringify(broadcastData));
-                            }
                         });
                     } catch (dbError) {
-                        console.error('❌ Database error:', dbError.message);
-                        ws.send(JSON.stringify({ type: 'db_error', message: dbError.message }));
+                        console.error('Database error:', dbError.message);
                     }
                     break;
                     
+                // ============ PASSENGER AUTH ============
                 case 'passenger_auth':
                     passengerClients.add(ws);
+                    currentPassengerId = data.passenger_id;
                     ws.send(JSON.stringify({ type: 'auth_success', role: 'passenger' }));
-                    console.log('✅ Passenger authenticated');
+                    console.log(`✅ Passenger authenticated`);
                     
-                    // Send initial nearby drivers if location provided
                     if (data.latitude && data.longitude) {
-                        console.log(`📍 Passenger location: ${data.latitude}, ${data.longitude}`);
                         const drivers = await getNearbyDrivers(data.latitude, data.longitude);
-                        console.log(`📊 Sending ${drivers.length} nearby drivers to passenger`);
                         ws.send(JSON.stringify({
                             type: 'initial_drivers',
                             drivers: drivers
@@ -199,8 +206,8 @@ wss.on('connection', (ws, req) => {
                     }
                     break;
                     
+                // ============ PASSENGER LOCATION ============
                 case 'passenger_location':
-                    // Update passenger location and send nearby drivers
                     if (data.latitude && data.longitude) {
                         const nearbyDrivers = await getNearbyDrivers(data.latitude, data.longitude);
                         ws.send(JSON.stringify({
@@ -210,25 +217,197 @@ wss.on('connection', (ws, req) => {
                     }
                     break;
                     
+                // ============ PASSENGER REQUESTS RIDE ============
+                case 'request_ride':
+                    console.log(`🚗 Ride request from passenger`);
+                    
+                    // Save ride request to database
+                    const insertRide = `
+                        INSERT INTO ride_requests (
+                            passenger_id, pickup_lat, pickup_lng, pickup_address, 
+                            dropoff_lat, dropoff_lng, dropoff_address, status,
+                            passenger_name, passenger_phone
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, 'bidding', ?, ?)
+                    `;
+                    
+                    const [result] = await db.promise().execute(insertRide, [
+                        data.passenger_id || 0,
+                        data.pickup_lat, data.pickup_lng, data.pickup_address || '',
+                        data.dropoff_lat, data.dropoff_lng, data.dropoff_address || '',
+                        data.passenger_name || 'Guest',
+                        data.passenger_phone || ''
+                    ]);
+                    
+                    const rideRequestId = result.insertId;
+                    
+                    // Store ride request ID for this passenger's WebSocket
+                    ws.rideRequestId = rideRequestId;
+                    
+                    // Notify nearby drivers about the ride request
+                    const nearbyDriversList = await getNearbyDrivers(data.pickup_lat, data.pickup_lng, 5);
+                    
+                    for (const driver of nearbyDriversList) {
+                        sendToDriver(driver.driver_id, {
+                            type: 'new_ride_request',
+                            ride_request_id: rideRequestId,
+                            pickup_lat: data.pickup_lat,
+                            pickup_lng: data.pickup_lng,
+                            pickup_address: data.pickup_address || 'Pickup location',
+                            dropoff_lat: data.dropoff_lat,
+                            dropoff_lng: data.dropoff_lng,
+                            dropoff_address: data.dropoff_address || 'Dropoff location',
+                            distance: driver.distance,
+                            passenger_name: data.passenger_name || 'Guest'
+                        });
+                    }
+                    
+                    ws.send(JSON.stringify({
+                        type: 'ride_requested',
+                        ride_request_id: rideRequestId,
+                        message: 'Ride request sent to nearby drivers'
+                    }));
+                    break;
+                    
+                // ============ DRIVER SENDS BID ============
+                case 'driver_bid':
+                    console.log(`💰 Driver ${data.driver_id} placed bid of ₹${data.bid_amount}`);
+                    
+                    // Save bid to database
+                    const insertBid = `
+                        INSERT INTO driver_bids (ride_request_id, driver_id, bid_amount, status)
+                        VALUES (?, ?, ?, 'pending')
+                    `;
+                    await db.promise().execute(insertBid, [data.ride_request_id, data.driver_id, data.bid_amount]);
+                    
+                    // Update ride request status to 'bidding' if not already
+                    await db.promise().execute(
+                        `UPDATE ride_requests SET status = 'bidding' WHERE id = ?`, 
+                        [data.ride_request_id]
+                    );
+                    
+                    // Get driver name
+                    const [driverInfo] = await db.promise().execute(
+                        'SELECT name FROM users WHERE id = ?', 
+                        [data.driver_id]
+                    );
+                    const driverName = driverInfo[0]?.name || 'Driver';
+                    
+                    // Find the passenger who requested this ride and send the bid
+                    const [rideRequest] = await db.promise().execute(
+                        'SELECT passenger_id FROM ride_requests WHERE id = ?', 
+                        [data.ride_request_id]
+                    );
+                    
+                    // Broadcast bid to all passengers (in reality, should send only to the specific passenger)
+                    broadcastToPassengers({
+                        type: 'new_bid',
+                        ride_request_id: data.ride_request_id,
+                        driver_id: data.driver_id,
+                        driver_name: driverName,
+                        bid_amount: data.bid_amount
+                    });
+                    break;
+                    
+                // ============ PASSENGER ACCEPTS BID ============
+                case 'accept_bid':
+                    console.log(`✅ Passenger accepted bid from driver ${data.driver_id} for ₹${data.bid_amount}`);
+                    
+                    // Update bid status
+                    await db.promise().execute(
+                        `UPDATE driver_bids SET status = 'accepted' 
+                         WHERE ride_request_id = ? AND driver_id = ?`,
+                        [data.ride_request_id, data.driver_id]
+                    );
+                    
+                    // Reject all other bids for this ride
+                    await db.promise().execute(
+                        `UPDATE driver_bids SET status = 'declined' 
+                         WHERE ride_request_id = ? AND driver_id != ?`,
+                        [data.ride_request_id, data.driver_id]
+                    );
+                    
+                    // Update ride request status
+                    await db.promise().execute(
+                        `UPDATE ride_requests SET status = 'accepted', driver_id = ? WHERE id = ?`,
+                        [data.driver_id, data.ride_request_id]
+                    );
+                    
+                    // Create active ride
+                    await db.promise().execute(
+                        `INSERT INTO active_rides (ride_request_id, passenger_id, driver_id, bid_amount, status)
+                         SELECT ?, passenger_id, ?, ?, 'active' FROM ride_requests WHERE id = ?`,
+                        [data.ride_request_id, data.driver_id, data.bid_amount, data.ride_request_id]
+                    );
+                    
+                    // Notify the driver
+                    sendToDriver(data.driver_id, {
+                        type: 'bid_accepted',
+                        ride_request_id: data.ride_request_id,
+                        message: 'Your bid has been accepted!'
+                    });
+                    
+                    // Notify the passenger
+                    ws.send(JSON.stringify({
+                        type: 'bid_accepted',
+                        driver_id: data.driver_id,
+                        message: `Driver accepted! Ride confirmed at ₹${data.bid_amount}`
+                    }));
+                    break;
+                    
+                // ============ PASSENGER DECLINES BID ============
+                case 'decline_bid':
+                    console.log(`❌ Passenger declined bid from driver ${data.driver_id}`);
+                    
+                    await db.promise().execute(
+                        `UPDATE driver_bids SET status = 'declined' 
+                         WHERE ride_request_id = ? AND driver_id = ?`,
+                        [data.ride_request_id, data.driver_id]
+                    );
+                    
+                    sendToDriver(data.driver_id, {
+                        type: 'bid_declined',
+                        ride_request_id: data.ride_request_id,
+                        message: 'Your bid was declined'
+                    });
+                    break;
+                    
+                // ============ DRIVER CANCELS RIDE ============
+                case 'driver_cancel_ride':
+                    console.log(`❌ Driver ${data.driver_id} cancelled ride`);
+                    
+                    await db.promise().execute(
+                        `UPDATE active_rides SET status = 'cancelled' WHERE ride_request_id = ?`,
+                        [data.ride_request_id]
+                    );
+                    
+                    await db.promise().execute(
+                        `UPDATE ride_requests SET status = 'cancelled' WHERE id = ?`,
+                        [data.ride_request_id]
+                    );
+                    
+                    broadcastToPassengers({
+                        type: 'ride_cancelled',
+                        ride_request_id: data.ride_request_id,
+                        message: 'Driver cancelled the ride'
+                    });
+                    break;
+                    
+                // ============ DRIVER OFFLINE ============
                 case 'driver_offline':
                     try {
                         await db.promise().execute('UPDATE driver_locations SET is_online = 0 WHERE driver_id = ?', [data.driver_id]);
                         console.log(`✅ Driver ${data.driver_id} went offline`);
                         
-                        // Broadcast to passengers that driver went offline
-                        passengerClients.forEach(client => {
-                            if (client.readyState === WebSocket.OPEN) {
-                                client.send(JSON.stringify({
-                                    type: 'driver_offline',
-                                    driver_id: data.driver_id
-                                }));
-                            }
+                        broadcastToPassengers({
+                            type: 'driver_offline',
+                            driver_id: data.driver_id
                         });
                     } catch (err) {
                         console.error('Offline update error:', err.message);
                     }
                     break;
                     
+                // ============ PING ============
                 case 'ping':
                     ws.send(JSON.stringify({ type: 'pong', timestamp: Date.now() }));
                     break;
@@ -273,23 +452,8 @@ setInterval(async () => {
     }
 }, 60000);
 
-// Also clean up old records from otp_codes table (optional)
-setInterval(async () => {
-    try {
-        const [result] = await db.promise().execute(`
-            DELETE FROM otp_codes WHERE expires_at < NOW()
-        `);
-        if (result.affectedRows > 0) {
-            console.log(`🧹 Cleaned up ${result.affectedRows} expired OTPs`);
-        }
-    } catch (error) {
-        console.error('OTP cleanup error:', error);
-    }
-}, 3600000); // Every hour
-
 const PORT = process.env.PORT || 8080;
 server.listen(PORT, '0.0.0.0', () => {
     console.log(`✅ WebSocket server running on port ${PORT}`);
     console.log(`✅ Health check: https://mynode-savj.onrender.com/healthz`);
-    console.log(`✅ DB Test: https://mynode-savj.onrender.com/db-test`);
 });
