@@ -1,18 +1,24 @@
-// server.js - Updated with better database error handling
+// server.js - Full WebSocket Server for Render
 const WebSocket = require('ws');
 const mysql = require('mysql2/promise');
 const http = require('http');
 
 // Database configuration
 const dbConfig = {
-    host: 'srv657.hstgr.io', // or '77.37.35.160'
-    user: 'u442108067_rajithawalpola',
-    password: '12IEhou:P',
-    database: 'u442108067_testdb',
+    host: process.env.DB_HOST || 'srv657.hstgr.io',
+    user: process.env.DB_USER || 'u442108067_rajithawalpola',
+    password: process.env.DB_PASSWORD || '12IEhou:P',
+    database: process.env.DB_NAME || 'u442108067_testdb',
     waitForConnections: true,
     connectionLimit: 10,
     queueLimit: 0
 };
+
+console.log('📊 Database Config:', {
+    host: dbConfig.host,
+    user: dbConfig.user,
+    database: dbConfig.database
+});
 
 // Create HTTP server
 const server = http.createServer((req, res) => {
@@ -43,6 +49,9 @@ const server = http.createServer((req, res) => {
                     <li><strong>WebSocket:</strong> ws://${req.headers.host}</li>
                     <li><strong>Health:</strong> ${req.headers.host}/health</li>
                 </ul>
+                <hr>
+                <p>Database: ${dbConfig.database}</p>
+                <p>Host: ${dbConfig.host}</p>
             </body>
             </html>
         `);
@@ -103,6 +112,19 @@ async function createLocationsTable() {
     try {
         await pool.execute(createTableSQL);
         console.log('✅ Driver locations table ready');
+        
+        // Check if drivers table has location columns
+        try {
+            await pool.execute(`
+                ALTER TABLE drivers 
+                ADD COLUMN IF NOT EXISTS last_latitude DECIMAL(10, 8) NULL,
+                ADD COLUMN IF NOT EXISTS last_longitude DECIMAL(11, 8) NULL,
+                ADD COLUMN IF NOT EXISTS last_location_update TIMESTAMP NULL
+            `);
+            console.log('✅ Drivers table updated with location columns');
+        } catch (alterError) {
+            console.log('⚠️ Could not alter drivers table (columns may already exist):', alterError.message);
+        }
     } catch (error) {
         console.error('❌ Failed to create locations table:', error.message);
         console.error('Full error:', error);
@@ -117,9 +139,6 @@ async function updateDriverLocation(driverId, locationData) {
     }
     
     try {
-        console.log('💾 Attempting to save location for driver:', driverId);
-        console.log('📍 Location data:', locationData);
-        
         const { 
             latitude, 
             longitude, 
@@ -137,17 +156,15 @@ async function updateDriverLocation(driverId, locationData) {
         }
         
         // Check if driver exists
-        const checkDriver = await pool.execute(
+        const [checkDriver] = await pool.execute(
             'SELECT id FROM drivers WHERE id = ? AND status != "suspended"',
             [driverId]
         );
         
-        if (checkDriver[0].length === 0) {
+        if (checkDriver.length === 0) {
             console.error('❌ Driver not found or suspended:', driverId);
             return false;
         }
-        
-        console.log('✅ Driver found, updating location...');
         
         // UPSERT query - insert or update
         const query = `
@@ -177,8 +194,6 @@ async function updateDriverLocation(driverId, locationData) {
             status
         ]);
         
-        console.log('✅ Location inserted/updated, affected rows:', result.affectedRows);
-        
         // Also update drivers table with last known location
         const updateDriverSQL = `
             UPDATE drivers 
@@ -189,13 +204,44 @@ async function updateDriverLocation(driverId, locationData) {
             WHERE id = ?
         `;
         
-        const [driverResult] = await pool.execute(updateDriverSQL, [latitude, longitude, driverId]);
-        console.log('✅ Driver table updated, affected rows:', driverResult.affectedRows);
+        await pool.execute(updateDriverSQL, [latitude, longitude, driverId]);
         
         return true;
     } catch (error) {
         console.error('❌ Failed to update location:', error.message);
         console.error('Full error:', error);
+        return false;
+    }
+}
+
+async function updateDriverOffline(driverId) {
+    if (!pool) {
+        console.error('❌ Database not initialized');
+        return false;
+    }
+    
+    try {
+        // Update driver_locations table status to offline
+        const locationQuery = `
+            UPDATE driver_locations 
+            SET status = 'offline', last_update = NOW() 
+            WHERE driver_id = ?
+        `;
+        await pool.execute(locationQuery, [driverId]);
+        console.log(`✅ Driver ${driverId} marked offline in driver_locations`);
+        
+        // Also update drivers table status
+        const driverQuery = `
+            UPDATE drivers 
+            SET status = 'inactive' 
+            WHERE id = ?
+        `;
+        await pool.execute(driverQuery, [driverId]);
+        console.log(`✅ Driver ${driverId} marked offline in drivers`);
+        
+        return true;
+    } catch (error) {
+        console.error('❌ Failed to update offline status:', error.message);
         return false;
     }
 }
@@ -262,9 +308,9 @@ wss.on('connection', (ws, req) => {
                     break;
                     
                 case 'driver_location_update':
-                    driverId = message.driver_id;
+                    const updateDriverId = message.driver_id;
                     
-                    if (!driverId || !message.location) {
+                    if (!updateDriverId || !message.location) {
                         ws.send(JSON.stringify({
                             type: 'error',
                             message: 'Missing driver_id or location data'
@@ -283,11 +329,11 @@ wss.on('connection', (ws, req) => {
                     }
                     
                     // Update connection data
-                    if (connectedDrivers.has(driverId)) {
-                        const driverData = connectedDrivers.get(driverId);
+                    if (connectedDrivers.has(updateDriverId)) {
+                        const driverData = connectedDrivers.get(updateDriverId);
                         driverData.location = { latitude, longitude };
                         driverData.lastUpdate = Date.now();
-                        connectedDrivers.set(driverId, driverData);
+                        connectedDrivers.set(updateDriverId, driverData);
                     }
                     
                     // Save to database
@@ -301,21 +347,19 @@ wss.on('connection', (ws, req) => {
                         status: status || 'online'
                     };
                     
-                    console.log(`💾 Saving location for driver ${driverId}:`, locationData);
-                    
-                    const saved = await updateDriverLocation(driverId, locationData);
+                    const saved = await updateDriverLocation(updateDriverId, locationData);
                     
                     if (saved) {
-                        broadcastLocation(driverId, locationData, ws);
+                        broadcastLocation(updateDriverId, locationData, ws);
                         
                         ws.send(JSON.stringify({
                             type: 'location_ack',
-                            driver_id: driverId,
+                            driver_id: updateDriverId,
                             timestamp: new Date().toISOString()
                         }));
-                        console.log(`✅ Location saved for driver ${driverId}`);
+                        console.log(`✅ Location saved for driver ${updateDriverId}`);
                     } else {
-                        console.error(`❌ Failed to save location for driver ${driverId}`);
+                        console.error(`❌ Failed to save location for driver ${updateDriverId}`);
                         ws.send(JSON.stringify({
                             type: 'error',
                             message: 'Failed to save location'
@@ -333,10 +377,34 @@ wss.on('connection', (ws, req) => {
                     break;
                     
                 case 'driver_offline':
+                    console.log('🔴 Driver going offline:', message.driver_id);
                     const offlineDriverId = message.driver_id;
+                    
                     if (offlineDriverId) {
+                        // Remove from connected drivers
                         connectedDrivers.delete(offlineDriverId);
-                        console.log(`🔴 Driver ${offlineDriverId} went offline`);
+                        
+                        // Update database status to offline
+                        await updateDriverOffline(offlineDriverId);
+                        
+                        // Broadcast to other clients
+                        const offlineMsg = JSON.stringify({
+                            type: 'driver_offline',
+                            driver_id: offlineDriverId,
+                            timestamp: new Date().toISOString()
+                        });
+                        
+                        wss.clients.forEach((client) => {
+                            if (client !== ws && client.readyState === WebSocket.OPEN) {
+                                client.send(offlineMsg);
+                            }
+                        });
+                        
+                        ws.send(JSON.stringify({
+                            type: 'offline_confirmed',
+                            driver_id: offlineDriverId,
+                            message: 'Driver is now offline'
+                        }));
                     }
                     break;
                     
@@ -357,6 +425,9 @@ wss.on('connection', (ws, req) => {
         if (driverId && isDriver) {
             connectedDrivers.delete(driverId);
             console.log(`🔴 Driver ${driverId} removed from connected list`);
+            
+            // Update status to offline in database
+            await updateDriverOffline(driverId);
         }
     });
     
@@ -364,6 +435,23 @@ wss.on('connection', (ws, req) => {
         console.error('❌ WebSocket error:', error.message);
     });
 });
+
+// Clean up inactive connections
+async function cleanupInactiveDrivers() {
+    const now = Date.now();
+    const timeout = 120000; // 2 minutes timeout
+    
+    for (const [driverId, data] of connectedDrivers.entries()) {
+        if (now - data.lastUpdate > timeout) {
+            console.log(`🟡 Cleaning up inactive driver ${driverId}`);
+            connectedDrivers.delete(driverId);
+            await updateDriverOffline(driverId);
+        }
+    }
+}
+
+// Periodic cleanup (every 30 seconds)
+setInterval(cleanupInactiveDrivers, 30000);
 
 // Start server
 const PORT = process.env.PORT || 8080;
@@ -386,10 +474,21 @@ async function startServer() {
 // Graceful shutdown
 process.on('SIGINT', async () => {
     console.log('🛑 Shutting down...');
+    
+    // Mark all drivers offline
     if (pool) {
+        try {
+            await pool.execute('UPDATE driver_locations SET status = ?', ['offline']);
+            await pool.execute('UPDATE drivers SET status = ?', ['inactive']);
+            console.log('✅ All drivers marked offline');
+        } catch (error) {
+            console.error('❌ Failed to mark drivers offline:', error.message);
+        }
+        
         await pool.end();
         console.log('✅ Database connections closed');
     }
+    
     wss.close(() => {
         console.log('✅ WebSocket server closed');
         process.exit(0);
