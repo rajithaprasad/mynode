@@ -1,4 +1,4 @@
-// server.js - Full WebSocket Server for Render
+// server.js - Updated WebSocket Server (No Auto-Offline)
 const WebSocket = require('ws');
 const mysql = require('mysql2/promise');
 const http = require('http');
@@ -44,14 +44,9 @@ const server = http.createServer((req, res) => {
                 <p>Active Connections: ${wss ? wss.clients.size : 0}</p>
                 <p>WebSocket URL: ws://${req.headers.host}</p>
                 <hr>
-                <p>Endpoints:</p>
-                <ul>
-                    <li><strong>WebSocket:</strong> ws://${req.headers.host}</li>
-                    <li><strong>Health:</strong> ${req.headers.host}/health</li>
-                </ul>
-                <hr>
                 <p>Database: ${dbConfig.database}</p>
                 <p>Host: ${dbConfig.host}</p>
+                <p style="color:green;">✅ Auto-offline is DISABLED - Drivers stay online until manual disconnect</p>
             </body>
             </html>
         `);
@@ -113,7 +108,6 @@ async function createLocationsTable() {
         await pool.execute(createTableSQL);
         console.log('✅ Driver locations table ready');
         
-        // Check if drivers table has location columns
         try {
             await pool.execute(`
                 ALTER TABLE drivers 
@@ -262,6 +256,17 @@ function broadcastLocation(driverId, locationData, excludeClient = null) {
     });
 }
 
+// ============================================================
+// DISABLED AUTO-OFFLINE - Drivers stay online until manual disconnect
+// ============================================================
+// The cleanup function is commented out to prevent auto-offline
+/*
+async function cleanupInactiveDrivers() {
+    // This function is DISABLED - Drivers should only go offline manually
+    console.log('🟡 Auto-offline is DISABLED - Drivers stay online until manual disconnect');
+}
+*/
+
 // WebSocket connection handler
 wss.on('connection', (ws, req) => {
     console.log('🟢 New client connected');
@@ -408,6 +413,20 @@ wss.on('connection', (ws, req) => {
                     }
                     break;
                     
+                case 'heartbeat':
+                    // Respond to heartbeat
+                    ws.send(JSON.stringify({
+                        type: 'heartbeat_ack',
+                        timestamp: Date.now()
+                    }));
+                    // Update lastUpdate for this driver
+                    if (driverId && connectedDrivers.has(driverId)) {
+                        const driverData = connectedDrivers.get(driverId);
+                        driverData.lastUpdate = Date.now();
+                        connectedDrivers.set(driverId, driverData);
+                    }
+                    break;
+                    
                 default:
                     console.log('⚠️ Unknown message type:', message.type);
             }
@@ -426,7 +445,9 @@ wss.on('connection', (ws, req) => {
             connectedDrivers.delete(driverId);
             console.log(`🔴 Driver ${driverId} removed from connected list`);
             
-            // Update status to offline in database
+            // IMPORTANT: Only mark offline if the driver didn't send an offline message
+            // The driver should send 'driver_offline' before disconnecting
+            // But we'll mark offline as a fallback
             await updateDriverOffline(driverId);
         }
     });
@@ -436,22 +457,11 @@ wss.on('connection', (ws, req) => {
     });
 });
 
-// Clean up inactive connections
-async function cleanupInactiveDrivers() {
-    const now = Date.now();
-    const timeout = 120000; // 2 minutes timeout
-    
-    for (const [driverId, data] of connectedDrivers.entries()) {
-        if (now - data.lastUpdate > timeout) {
-            console.log(`🟡 Cleaning up inactive driver ${driverId}`);
-            connectedDrivers.delete(driverId);
-            await updateDriverOffline(driverId);
-        }
-    }
-}
-
-// Periodic cleanup (every 30 seconds)
-setInterval(cleanupInactiveDrivers, 30000);
+// ============================================================
+// NO AUTO-OFFLINE CLEANUP - Disabled completely
+// ============================================================
+// The interval is disabled to prevent auto-offline
+// setInterval(cleanupInactiveDrivers, 60000);
 
 // Start server
 const PORT = process.env.PORT || 8080;
@@ -468,6 +478,7 @@ async function startServer() {
         console.log(`📍 WebSocket URL: ws://localhost:${PORT}`);
         console.log(`📊 Health check: http://localhost:${PORT}/health`);
         console.log('✅ Server ready');
+        console.log('🟢 Auto-offline is DISABLED - Drivers stay online until manual disconnect');
     });
 }
 
