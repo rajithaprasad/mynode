@@ -1,4 +1,4 @@
-// server.js - Updated WebSocket Server
+// server.js - Complete WebSocket Server with Subscription Management
 const WebSocket = require('ws');
 const mysql = require('mysql2/promise');
 const http = require('http');
@@ -47,6 +47,7 @@ const server = http.createServer((req, res) => {
                 <p>Database: ${dbConfig.database}</p>
                 <p>Host: ${dbConfig.host}</p>
                 <p style="color:green;">✅ Auto-offline is DISABLED - Drivers stay online until manual disconnect</p>
+                <p style="color:blue;">✅ Subscription monitoring is ENABLED - Expired subscriptions are auto-offline</p>
             </body>
             </html>
         `);
@@ -126,6 +127,57 @@ async function createLocationsTable() {
     }
 }
 
+// ============================================================
+// SUBSCRIPTION CHECK FUNCTION
+// ============================================================
+async function checkDriverSubscription(driverId) {
+    if (!pool) {
+        console.error('❌ Database not initialized');
+        return { isExpired: true, status: 'expired' };
+    }
+    
+    try {
+        const [rows] = await pool.execute(
+            'SELECT subscription_status, subscription_expires_at FROM drivers WHERE id = ?',
+            [driverId]
+        );
+        
+        if (rows.length === 0) {
+            return { isExpired: true, status: 'expired' };
+        }
+        
+        const driver = rows[0];
+        let isExpired = false;
+        
+        if (driver.subscription_status === 'expired') {
+            isExpired = true;
+        } else if (driver.subscription_expires_at) {
+            const expiryDate = new Date(driver.subscription_expires_at);
+            const now = new Date();
+            if (now > expiryDate) {
+                isExpired = true;
+                await pool.execute(
+                    'UPDATE drivers SET subscription_status = ? WHERE id = ?',
+                    ['expired', driverId]
+                );
+                console.log(`🔴 Driver ${driverId} subscription auto-expired`);
+            }
+        }
+        
+        return {
+            isExpired: isExpired,
+            status: driver.subscription_status || 'trial',
+            expires_at: driver.subscription_expires_at
+        };
+    } catch (error) {
+        console.error('❌ Failed to check subscription:', error.message);
+        return { isExpired: true, status: 'expired' };
+    }
+}
+
+// ============================================================
+// UPDATE DRIVER FUNCTIONS
+// ============================================================
 async function updateDriverLocation(driverId, locationData) {
     if (!pool) {
         console.error('❌ Database not initialized');
@@ -234,6 +286,7 @@ async function updateDriverOffline(driverId) {
     }
 }
 
+// Broadcast location to all connected clients
 function broadcastLocation(driverId, locationData, excludeClient = null) {
     const message = JSON.stringify({
         type: 'driver_location_update',
@@ -249,6 +302,9 @@ function broadcastLocation(driverId, locationData, excludeClient = null) {
     });
 }
 
+// ============================================================
+// WEBSOCKET CONNECTION HANDLER
+// ============================================================
 wss.on('connection', (ws, req) => {
     console.log('🟢 New client connected');
     let driverId = null;
@@ -278,18 +334,34 @@ wss.on('connection', (ws, req) => {
                         return;
                     }
                     
+                    // Check subscription before allowing online
+                    const subStatus = await checkDriverSubscription(driverId);
+                    
+                    if (subStatus.isExpired) {
+                        ws.send(JSON.stringify({
+                            type: 'subscription_expired',
+                            message: 'Your subscription has expired. Please renew to continue.',
+                            status: 'expired',
+                            driver_id: driverId
+                        }));
+                        console.log(`🔴 Driver ${driverId} subscription expired, registration rejected`);
+                        return;
+                    }
+                    
                     connectedDrivers.set(driverId, {
                         ws: ws,
                         location: null,
-                        lastUpdate: Date.now()
+                        lastUpdate: Date.now(),
+                        subscription: subStatus
                     });
                     
-                    console.log(`✅ Driver ${driverId} registered`);
+                    console.log(`✅ Driver ${driverId} registered (Subscription: ${subStatus.status})`);
                     
                     ws.send(JSON.stringify({
                         type: 'registration_success',
                         driver_id: driverId,
-                        message: 'Driver registered successfully'
+                        message: 'Driver registered successfully',
+                        subscription: subStatus
                     }));
                     break;
                     
@@ -301,6 +373,24 @@ wss.on('connection', (ws, req) => {
                             type: 'error',
                             message: 'Missing driver_id or location data'
                         }));
+                        return;
+                    }
+                    
+                    // Check subscription before processing location
+                    const subCheck = await checkDriverSubscription(updateDriverId);
+                    
+                    if (subCheck.isExpired) {
+                        // Remove from connected drivers
+                        connectedDrivers.delete(updateDriverId);
+                        ws.send(JSON.stringify({
+                            type: 'subscription_expired',
+                            message: 'Your subscription has expired. Please renew to continue.',
+                            status: 'expired',
+                            driver_id: updateDriverId
+                        }));
+                        // Also update driver status to offline
+                        await updateDriverOffline(updateDriverId);
+                        console.log(`🔴 Driver ${updateDriverId} subscription expired, removed from online`);
                         return;
                     }
                     
@@ -352,7 +442,7 @@ wss.on('connection', (ws, req) => {
                     break;
                     
                 case 'get_nearby_drivers':
-                    console.log('🔍 Getting all nearby drivers from database...');
+                    console.log('🔍 Getting nearby drivers from database...');
                     const { lat, lng, radius = 100 } = message;
                     
                     if (!lat || !lng) {
@@ -487,7 +577,33 @@ wss.on('connection', (ws, req) => {
     });
 });
 
-// Start server
+// ============================================================
+// PERIODIC SUBSCRIPTION CHECK
+// ============================================================
+setInterval(async () => {
+    console.log('🔍 Running periodic subscription check...');
+    for (const [driverId, data] of connectedDrivers.entries()) {
+        const subCheck = await checkDriverSubscription(driverId);
+        if (subCheck.isExpired) {
+            console.log(`🔴 Driver ${driverId} subscription expired, removing from online`);
+            connectedDrivers.delete(driverId);
+            await updateDriverOffline(driverId);
+            
+            if (data.ws && data.ws.readyState === WebSocket.OPEN) {
+                data.ws.send(JSON.stringify({
+                    type: 'subscription_expired',
+                    message: 'Your subscription has expired. You have been taken offline.',
+                    status: 'expired',
+                    driver_id: driverId
+                }));
+            }
+        }
+    }
+}, 30000); // Check every 30 seconds
+
+// ============================================================
+// START SERVER
+// ============================================================
 const PORT = process.env.PORT || 8080;
 
 async function startServer() {
@@ -503,7 +619,7 @@ async function startServer() {
         console.log(`📊 Health check: http://localhost:${PORT}/health`);
         console.log('✅ Server ready');
         console.log('🟢 Auto-offline is DISABLED - Drivers stay online until manual disconnect');
-        console.log('📍 Showing ALL online drivers (radius set to 100km)');
+        console.log('🔵 Subscription monitoring is ENABLED - Expired subscriptions are auto-offline');
     });
 }
 
