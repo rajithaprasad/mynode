@@ -256,17 +256,6 @@ function broadcastLocation(driverId, locationData, excludeClient = null) {
     });
 }
 
-// ============================================================
-// DISABLED AUTO-OFFLINE - Drivers stay online until manual disconnect
-// ============================================================
-// The cleanup function is commented out to prevent auto-offline
-/*
-async function cleanupInactiveDrivers() {
-    // This function is DISABLED - Drivers should only go offline manually
-    console.log('🟡 Auto-offline is DISABLED - Drivers stay online until manual disconnect');
-}
-*/
-
 // WebSocket connection handler
 wss.on('connection', (ws, req) => {
     console.log('🟢 New client connected');
@@ -445,10 +434,19 @@ wss.on('connection', (ws, req) => {
             connectedDrivers.delete(driverId);
             console.log(`🔴 Driver ${driverId} removed from connected list`);
             
-            // IMPORTANT: Only mark offline if the driver didn't send an offline message
-            // The driver should send 'driver_offline' before disconnecting
-            // But we'll mark offline as a fallback
-            await updateDriverOffline(driverId);
+            // Check if this was an intentional disconnect
+            // The driver should send 'driver_offline' before disconnecting for intentional offline
+            // We'll check if the driver is still in the connected drivers list with a delay
+            // If not, mark offline after a short delay to allow for reconnection
+            setTimeout(async () => {
+                // Check if driver reconnected
+                if (!connectedDrivers.has(driverId)) {
+                    console.log(`🔴 Driver ${driverId} did not reconnect, marking offline`);
+                    await updateDriverOffline(driverId);
+                } else {
+                    console.log(`✅ Driver ${driverId} reconnected, keeping online`);
+                }
+            }, 5000); // 5 second delay to allow for reconnection
         }
     });
     
@@ -456,12 +454,6 @@ wss.on('connection', (ws, req) => {
         console.error('❌ WebSocket error:', error.message);
     });
 });
-
-// ============================================================
-// NO AUTO-OFFLINE CLEANUP - Disabled completely
-// ============================================================
-// The interval is disabled to prevent auto-offline
-// setInterval(cleanupInactiveDrivers, 60000);
 
 // Start server
 const PORT = process.env.PORT || 8080;
