@@ -1,4 +1,4 @@
-// server.js - Updated WebSocket Server (No Auto-Offline)
+// server.js - Updated WebSocket Server
 const WebSocket = require('ws');
 const mysql = require('mysql2/promise');
 const http = require('http');
@@ -143,13 +143,11 @@ async function updateDriverLocation(driverId, locationData) {
             status = 'online'
         } = locationData;
         
-        // Validate coordinates
         if (latitude < -90 || latitude > 90 || longitude < -180 || longitude > 180) {
             console.error('❌ Invalid coordinates:', { latitude, longitude });
             return false;
         }
         
-        // Check if driver exists
         const [checkDriver] = await pool.execute(
             'SELECT id FROM drivers WHERE id = ? AND status != "suspended"',
             [driverId]
@@ -160,7 +158,6 @@ async function updateDriverLocation(driverId, locationData) {
             return false;
         }
         
-        // UPSERT query - insert or update
         const query = `
             INSERT INTO driver_locations 
                 (driver_id, latitude, longitude, accuracy, speed, heading, altitude, status, last_update)
@@ -177,7 +174,7 @@ async function updateDriverLocation(driverId, locationData) {
                 last_update = NOW()
         `;
         
-        const [result] = await pool.execute(query, [
+        await pool.execute(query, [
             driverId,
             latitude,
             longitude,
@@ -188,7 +185,6 @@ async function updateDriverLocation(driverId, locationData) {
             status
         ]);
         
-        // Also update drivers table with last known location
         const updateDriverSQL = `
             UPDATE drivers 
             SET 
@@ -215,7 +211,6 @@ async function updateDriverOffline(driverId) {
     }
     
     try {
-        // Update driver_locations table status to offline
         const locationQuery = `
             UPDATE driver_locations 
             SET status = 'offline', last_update = NOW() 
@@ -224,7 +219,6 @@ async function updateDriverOffline(driverId) {
         await pool.execute(locationQuery, [driverId]);
         console.log(`✅ Driver ${driverId} marked offline in driver_locations`);
         
-        // Also update drivers table status
         const driverQuery = `
             UPDATE drivers 
             SET status = 'inactive' 
@@ -240,7 +234,6 @@ async function updateDriverOffline(driverId) {
     }
 }
 
-// Broadcast location to all connected clients
 function broadcastLocation(driverId, locationData, excludeClient = null) {
     const message = JSON.stringify({
         type: 'driver_location_update',
@@ -256,7 +249,6 @@ function broadcastLocation(driverId, locationData, excludeClient = null) {
     });
 }
 
-// WebSocket connection handler
 wss.on('connection', (ws, req) => {
     console.log('🟢 New client connected');
     let driverId = null;
@@ -322,7 +314,6 @@ wss.on('connection', (ws, req) => {
                         return;
                     }
                     
-                    // Update connection data
                     if (connectedDrivers.has(updateDriverId)) {
                         const driverData = connectedDrivers.get(updateDriverId);
                         driverData.location = { latitude, longitude };
@@ -330,7 +321,6 @@ wss.on('connection', (ws, req) => {
                         connectedDrivers.set(updateDriverId, driverData);
                     }
                     
-                    // Save to database
                     const locationData = {
                         latitude,
                         longitude,
@@ -362,12 +352,65 @@ wss.on('connection', (ws, req) => {
                     break;
                     
                 case 'get_nearby_drivers':
-                    // Simple response for now
-                    ws.send(JSON.stringify({
-                        type: 'nearby_drivers',
-                        drivers: [],
-                        timestamp: new Date().toISOString()
-                    }));
+                    console.log('🔍 Getting all nearby drivers from database...');
+                    const { lat, lng, radius = 100 } = message;
+                    
+                    if (!lat || !lng) {
+                        ws.send(JSON.stringify({
+                            type: 'error',
+                            message: 'Missing latitude or longitude'
+                        }));
+                        return;
+                    }
+                    
+                    try {
+                        const query = `
+                            SELECT 
+                                d.id,
+                                d.full_name,
+                                d.rating,
+                                d.total_trips,
+                                d.push_token,
+                                COALESCE(dl.latitude, d.last_latitude, 0) as latitude,
+                                COALESCE(dl.longitude, d.last_longitude, 0) as longitude,
+                                COALESCE(dl.status, 'offline') as status,
+                                dl.last_update,
+                                dl.accuracy,
+                                dl.speed,
+                                (
+                                    6371 * ACOS(
+                                        COS(RADIANS(?)) * COS(RADIANS(COALESCE(dl.latitude, d.last_latitude, 0))) * 
+                                        COS(RADIANS(COALESCE(dl.longitude, d.last_longitude, 0)) - RADIANS(?)) + 
+                                        SIN(RADIANS(?)) * SIN(RADIANS(COALESCE(dl.latitude, d.last_latitude, 0)))
+                                    )
+                                ) AS distance_km
+                            FROM drivers d
+                            LEFT JOIN driver_locations dl ON d.id = dl.driver_id
+                            WHERE d.status = 'active'
+                            AND (dl.status IN ('online', 'busy') OR d.status = 'active')
+                            AND TIMESTAMPDIFF(MINUTE, COALESCE(dl.last_update, d.last_location_update, NOW()), NOW()) < 15
+                            HAVING distance_km <= ?
+                            ORDER BY distance_km ASC
+                        `;
+                        
+                        const [rows] = await pool.execute(query, [lat, lng, lat, radius]);
+                        
+                        console.log(`✅ Found ${rows.length} nearby drivers`);
+                        
+                        ws.send(JSON.stringify({
+                            type: 'nearby_drivers',
+                            drivers: rows,
+                            timestamp: new Date().toISOString()
+                        }));
+                    } catch (error) {
+                        console.error('❌ Failed to get nearby drivers:', error.message);
+                        ws.send(JSON.stringify({
+                            type: 'nearby_drivers',
+                            drivers: [],
+                            error: error.message,
+                            timestamp: new Date().toISOString()
+                        }));
+                    }
                     break;
                     
                 case 'driver_offline':
@@ -375,13 +418,9 @@ wss.on('connection', (ws, req) => {
                     const offlineDriverId = message.driver_id;
                     
                     if (offlineDriverId) {
-                        // Remove from connected drivers
                         connectedDrivers.delete(offlineDriverId);
-                        
-                        // Update database status to offline
                         await updateDriverOffline(offlineDriverId);
                         
-                        // Broadcast to other clients
                         const offlineMsg = JSON.stringify({
                             type: 'driver_offline',
                             driver_id: offlineDriverId,
@@ -403,12 +442,10 @@ wss.on('connection', (ws, req) => {
                     break;
                     
                 case 'heartbeat':
-                    // Respond to heartbeat
                     ws.send(JSON.stringify({
                         type: 'heartbeat_ack',
                         timestamp: Date.now()
                     }));
-                    // Update lastUpdate for this driver
                     if (driverId && connectedDrivers.has(driverId)) {
                         const driverData = connectedDrivers.get(driverId);
                         driverData.lastUpdate = Date.now();
@@ -434,19 +471,14 @@ wss.on('connection', (ws, req) => {
             connectedDrivers.delete(driverId);
             console.log(`🔴 Driver ${driverId} removed from connected list`);
             
-            // Check if this was an intentional disconnect
-            // The driver should send 'driver_offline' before disconnecting for intentional offline
-            // We'll check if the driver is still in the connected drivers list with a delay
-            // If not, mark offline after a short delay to allow for reconnection
             setTimeout(async () => {
-                // Check if driver reconnected
                 if (!connectedDrivers.has(driverId)) {
                     console.log(`🔴 Driver ${driverId} did not reconnect, marking offline`);
                     await updateDriverOffline(driverId);
                 } else {
                     console.log(`✅ Driver ${driverId} reconnected, keeping online`);
                 }
-            }, 5000); // 5 second delay to allow for reconnection
+            }, 5000);
         }
     });
     
@@ -471,6 +503,7 @@ async function startServer() {
         console.log(`📊 Health check: http://localhost:${PORT}/health`);
         console.log('✅ Server ready');
         console.log('🟢 Auto-offline is DISABLED - Drivers stay online until manual disconnect');
+        console.log('📍 Showing ALL online drivers (radius set to 100km)');
     });
 }
 
@@ -478,7 +511,6 @@ async function startServer() {
 process.on('SIGINT', async () => {
     console.log('🛑 Shutting down...');
     
-    // Mark all drivers offline
     if (pool) {
         try {
             await pool.execute('UPDATE driver_locations SET status = ?', ['offline']);
