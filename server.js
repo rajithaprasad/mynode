@@ -1,4 +1,4 @@
-// server.js - Complete WebSocket Server with Subscription Management
+// server.js - Complete WebSocket Server with Subscription Management (No Auto-Offline)
 const WebSocket = require('ws');
 const mysql = require('mysql2/promise');
 const http = require('http');
@@ -256,6 +256,9 @@ async function updateDriverLocation(driverId, locationData) {
     }
 }
 
+// ============================================================
+// UPDATE DRIVER OFFLINE - ONLY CALLED WHEN DRIVER MANUALLY GOES OFFLINE
+// ============================================================
 async function updateDriverOffline(driverId) {
     if (!pool) {
         console.error('❌ Database not initialized');
@@ -388,7 +391,7 @@ wss.on('connection', (ws, req) => {
                             status: 'expired',
                             driver_id: updateDriverId
                         }));
-                        // Also update driver status to offline
+                        // Update driver status to offline due to subscription expiry
                         await updateDriverOffline(updateDriverId);
                         console.log(`🔴 Driver ${updateDriverId} subscription expired, removed from online`);
                         return;
@@ -508,7 +511,9 @@ wss.on('connection', (ws, req) => {
                     const offlineDriverId = message.driver_id;
                     
                     if (offlineDriverId) {
+                        // Remove from connected drivers
                         connectedDrivers.delete(offlineDriverId);
+                        // Mark offline in database
                         await updateDriverOffline(offlineDriverId);
                         
                         const offlineMsg = JSON.stringify({
@@ -555,30 +560,28 @@ wss.on('connection', (ws, req) => {
         }
     });
     
+    // ============================================================
+    // ON CLOSE - DO NOT MARK OFFLINE AUTOMATICALLY
+    // ============================================================
     ws.on('close', async () => {
         console.log('🔴 Client disconnected');
         if (driverId && isDriver) {
+            // Remove from connected drivers but DO NOT mark offline
+            // The driver will send 'driver_offline' message when they want to go offline
             connectedDrivers.delete(driverId);
-            console.log(`🔴 Driver ${driverId} removed from connected list`);
-            
-            setTimeout(async () => {
-                if (!connectedDrivers.has(driverId)) {
-                    console.log(`🔴 Driver ${driverId} did not reconnect, marking offline`);
-                    await updateDriverOffline(driverId);
-                } else {
-                    console.log(`✅ Driver ${driverId} reconnected, keeping online`);
-                }
-            }, 5000);
+            console.log(`🔴 Driver ${driverId} removed from connected list (status remains online)`);
+            // DO NOT call updateDriverOffline here - only when driver sends offline message
         }
     });
     
     ws.on('error', (error) => {
         console.error('❌ WebSocket error:', error.message);
+        // DO NOT mark offline on WebSocket error
     });
 });
 
 // ============================================================
-// PERIODIC SUBSCRIPTION CHECK
+// PERIODIC SUBSCRIPTION CHECK - ONLY THIS CAN AUTO-OFFLINE
 // ============================================================
 setInterval(async () => {
     console.log('🔍 Running periodic subscription check...');
@@ -619,7 +622,8 @@ async function startServer() {
         console.log(`📊 Health check: http://localhost:${PORT}/health`);
         console.log('✅ Server ready');
         console.log('🟢 Auto-offline is DISABLED - Drivers stay online until manual disconnect');
-        console.log('🔵 Subscription monitoring is ENABLED - Expired subscriptions are auto-offline');
+        console.log('🔵 Subscription monitoring is ENABLED - Only expired subscriptions are auto-offline');
+        console.log('⚠️ WebSocket disconnects will NOT mark drivers offline');
     });
 }
 
