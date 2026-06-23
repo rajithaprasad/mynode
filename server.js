@@ -340,8 +340,8 @@ async function getAllDrivers() {
             FROM drivers d
             LEFT JOIN driver_locations dl ON d.id = dl.driver_id
             WHERE d.status = 'active'
-            AND (dl.status IN ('online', 'busy') OR d.status = 'active')
-            AND TIMESTAMPDIFF(MINUTE, COALESCE(dl.last_update, d.last_location_update, NOW()), NOW()) < 15
+            AND (dl.status IN ('online', 'busy') OR d.status = 'active' OR dl.status IS NULL)
+            AND TIMESTAMPDIFF(MINUTE, COALESCE(dl.last_update, d.last_location_update, NOW()), NOW()) < 30
             ORDER BY d.full_name ASC
         `;
         
@@ -354,61 +354,6 @@ async function getAllDrivers() {
 }
 
 // ============================================================
-// GET NEARBY DRIVERS FUNCTION
-// ============================================================
-async function getNearbyDrivers(lat, lng, radius = 100) {
-    if (!pool) {
-        console.error('❌ Database not initialized');
-        return [];
-    }
-    
-    try {
-        const query = `
-            SELECT 
-                d.id,
-                d.full_name,
-                d.rating,
-                d.total_trips,
-                d.driver_type,
-                d.vehicle_make,
-                d.vehicle_model,
-                d.vehicle_color,
-                d.vehicle_plate,
-                d.rate_per_km,
-                d.vehicle_rate_per_km,
-                d.display_rate,
-                d.front_image,
-                d.back_image,
-                d.side_image,
-                COALESCE(dl.latitude, d.last_latitude, 0) as latitude,
-                COALESCE(dl.longitude, d.last_longitude, 0) as longitude,
-                COALESCE(dl.status, 'offline') as status,
-                dl.last_update,
-                (
-                    6371 * ACOS(
-                        COS(RADIANS(?)) * COS(RADIANS(COALESCE(dl.latitude, d.last_latitude, 0))) * 
-                        COS(RADIANS(COALESCE(dl.longitude, d.last_longitude, 0)) - RADIANS(?)) + 
-                        SIN(RADIANS(?)) * SIN(RADIANS(COALESCE(dl.latitude, d.last_latitude, 0)))
-                    )
-                ) AS distance_km
-            FROM drivers d
-            LEFT JOIN driver_locations dl ON d.id = dl.driver_id
-            WHERE d.status = 'active'
-            AND (dl.status IN ('online', 'busy') OR d.status = 'active')
-            AND TIMESTAMPDIFF(MINUTE, COALESCE(dl.last_update, d.last_location_update, NOW()), NOW()) < 15
-            HAVING distance_km <= ?
-            ORDER BY distance_km ASC
-        `;
-        
-        const [rows] = await pool.execute(query, [lat, lng, lat, radius]);
-        return rows;
-    } catch (error) {
-        console.error('❌ Failed to get nearby drivers:', error.message);
-        return [];
-    }
-}
-
-// ============================================================
 // WEBSOCKET CONNECTION HANDLER
 // ============================================================
 wss.on('connection', (ws, req) => {
@@ -416,11 +361,25 @@ wss.on('connection', (ws, req) => {
     let driverId = null;
     let isDriver = false;
     
+    // Send welcome message
     ws.send(JSON.stringify({
         type: 'welcome',
         message: 'Connected to Drivee WebSocket Server',
         timestamp: new Date().toISOString()
     }));
+    
+    // Immediately send all drivers to the new client
+    getAllDrivers().then(drivers => {
+        ws.send(JSON.stringify({
+            type: 'all_drivers',
+            drivers: drivers,
+            count: drivers.length,
+            timestamp: new Date().toISOString()
+        }));
+        console.log(`📨 Sent ${drivers.length} drivers to new client`);
+    }).catch(error => {
+        console.error('❌ Failed to send drivers to new client:', error.message);
+    });
     
     ws.on('message', async (data) => {
         try {
@@ -586,14 +545,51 @@ wss.on('connection', (ws, req) => {
                     }
                     
                     try {
-                        const nearbyDrivers = await getNearbyDrivers(lat, lng, radius);
+                        const query = `
+                            SELECT 
+                                d.id,
+                                d.full_name,
+                                d.rating,
+                                d.total_trips,
+                                d.driver_type,
+                                d.vehicle_make,
+                                d.vehicle_model,
+                                d.vehicle_color,
+                                d.vehicle_plate,
+                                d.rate_per_km,
+                                d.vehicle_rate_per_km,
+                                d.display_rate,
+                                d.front_image,
+                                d.back_image,
+                                d.side_image,
+                                COALESCE(dl.latitude, d.last_latitude, 0) as latitude,
+                                COALESCE(dl.longitude, d.last_longitude, 0) as longitude,
+                                COALESCE(dl.status, 'offline') as status,
+                                dl.last_update,
+                                (
+                                    6371 * ACOS(
+                                        COS(RADIANS(?)) * COS(RADIANS(COALESCE(dl.latitude, d.last_latitude, 0))) * 
+                                        COS(RADIANS(COALESCE(dl.longitude, d.last_longitude, 0)) - RADIANS(?)) + 
+                                        SIN(RADIANS(?)) * SIN(RADIANS(COALESCE(dl.latitude, d.last_latitude, 0)))
+                                    )
+                                ) AS distance_km
+                            FROM drivers d
+                            LEFT JOIN driver_locations dl ON d.id = dl.driver_id
+                            WHERE d.status = 'active'
+                            AND (dl.status IN ('online', 'busy') OR d.status = 'active' OR dl.status IS NULL)
+                            AND TIMESTAMPDIFF(MINUTE, COALESCE(dl.last_update, d.last_location_update, NOW()), NOW()) < 30
+                            HAVING distance_km <= ?
+                            ORDER BY distance_km ASC
+                        `;
                         
-                        console.log(`✅ Found ${nearbyDrivers.length} nearby drivers`);
+                        const [rows] = await pool.execute(query, [lat, lng, lat, radius]);
+                        
+                        console.log(`✅ Found ${rows.length} nearby drivers`);
                         
                         ws.send(JSON.stringify({
                             type: 'nearby_drivers',
-                            drivers: nearbyDrivers,
-                            count: nearbyDrivers.length,
+                            drivers: rows,
+                            count: rows.length,
                             timestamp: new Date().toISOString()
                         }));
                     } catch (error) {
@@ -713,22 +709,20 @@ setInterval(async () => {
     try {
         const allDrivers = await getAllDrivers();
         
+        const message = JSON.stringify({
+            type: 'all_drivers',
+            drivers: allDrivers,
+            count: allDrivers.length,
+            timestamp: new Date().toISOString()
+        });
+        
+        wss.clients.forEach((client) => {
+            if (client.readyState === WebSocket.OPEN) {
+                client.send(message);
+            }
+        });
+        
         if (allDrivers.length > 0) {
-            const message = JSON.stringify({
-                type: 'all_drivers',
-                drivers: allDrivers,
-                count: allDrivers.length,
-                timestamp: new Date().toISOString()
-            });
-            
-            wss.clients.forEach((client) => {
-                if (client.readyState === WebSocket.OPEN) {
-                    // Only send to passenger clients (those without driver registration)
-                    // We could track client types, but for simplicity we send to all
-                    client.send(message);
-                }
-            });
-            
             console.log(`📡 Broadcasted ${allDrivers.length} drivers to all clients`);
         }
     } catch (error) {
