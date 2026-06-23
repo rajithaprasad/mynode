@@ -1,4 +1,4 @@
-// server.js - Complete WebSocket Server with All Drivers Support
+// server.js - Complete WebSocket Server with Fixed Driver Retrieval
 const WebSocket = require('ws');
 const mysql = require('mysql2/promise');
 const http = require('http');
@@ -32,6 +32,24 @@ const server = http.createServer((req, res) => {
         return;
     }
     
+    if (req.url === '/debug-drivers') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        getAllDrivers().then(drivers => {
+            res.end(JSON.stringify({
+                success: true,
+                count: drivers.length,
+                drivers: drivers,
+                timestamp: new Date().toISOString()
+            }));
+        }).catch(error => {
+            res.end(JSON.stringify({
+                success: false,
+                error: error.message
+            }));
+        });
+        return;
+    }
+    
     if (req.url === '/') {
         res.writeHead(200, { 'Content-Type': 'text/html' });
         res.end(`
@@ -49,6 +67,7 @@ const server = http.createServer((req, res) => {
                 <p style="color:green;">✅ Auto-offline is DISABLED - Drivers stay online until manual disconnect</p>
                 <p style="color:blue;">✅ Subscription monitoring is ENABLED - Expired subscriptions are auto-offline</p>
                 <p style="color:purple;">✅ All drivers mode - No distance filter</p>
+                <p><a href="/debug-drivers">🔍 Debug: View All Drivers</a></p>
             </body>
             </html>
         `);
@@ -307,9 +326,70 @@ function broadcastLocation(driverId, locationData, excludeClient = null) {
 }
 
 // ============================================================
-// GET ALL DRIVERS FUNCTION
+// GET ALL DRIVERS FUNCTION - MATCHING REST API
 // ============================================================
 async function getAllDrivers() {
+    if (!pool) {
+        console.error('❌ Database not initialized');
+        return [];
+    }
+    
+    try {
+        // First, check if we have any drivers at all
+        const [countResult] = await pool.execute("SELECT COUNT(*) as count FROM drivers WHERE status = 'active'");
+        console.log(`📊 Total active drivers in DB: ${countResult[0].count}`);
+        
+        // Simple query to get all active drivers with their locations
+        const query = `
+            SELECT 
+                d.id,
+                d.full_name,
+                d.rating,
+                d.total_trips,
+                d.driver_type,
+                d.vehicle_make,
+                d.vehicle_model,
+                d.vehicle_color,
+                d.vehicle_plate,
+                d.rate_per_km,
+                d.vehicle_rate_per_km,
+                d.display_rate,
+                d.front_image,
+                d.back_image,
+                d.side_image,
+                d.status as driver_status,
+                COALESCE(dl.latitude, d.last_latitude, 0) as latitude,
+                COALESCE(dl.longitude, d.last_longitude, 0) as longitude,
+                COALESCE(dl.status, 'online') as status,
+                dl.last_update
+            FROM drivers d
+            LEFT JOIN driver_locations dl ON d.id = dl.driver_id
+            WHERE d.status = 'active'
+            ORDER BY d.full_name ASC
+        `;
+        
+        console.log('📝 Executing query to get all drivers...');
+        const [rows] = await pool.execute(query);
+        
+        console.log(`✅ Found ${rows.length} total drivers in database`);
+        
+        // Log first driver for debugging
+        if (rows.length > 0) {
+            console.log('📊 First driver:', JSON.stringify(rows[0]));
+        }
+        
+        return rows;
+    } catch (error) {
+        console.error('❌ Failed to get all drivers:', error.message);
+        console.error('❌ Error details:', error);
+        return [];
+    }
+}
+
+// ============================================================
+// GET NEARBY DRIVERS FUNCTION
+// ============================================================
+async function getNearbyDrivers(lat, lng, radius = 100) {
     if (!pool) {
         console.error('❌ Database not initialized');
         return [];
@@ -335,20 +415,26 @@ async function getAllDrivers() {
                 d.side_image,
                 COALESCE(dl.latitude, d.last_latitude, 0) as latitude,
                 COALESCE(dl.longitude, d.last_longitude, 0) as longitude,
-                COALESCE(dl.status, 'offline') as status,
-                dl.last_update
+                COALESCE(dl.status, 'online') as status,
+                dl.last_update,
+                (
+                    6371 * ACOS(
+                        COS(RADIANS(?)) * COS(RADIANS(COALESCE(dl.latitude, d.last_latitude, 0))) * 
+                        COS(RADIANS(COALESCE(dl.longitude, d.last_longitude, 0)) - RADIANS(?)) + 
+                        SIN(RADIANS(?)) * SIN(RADIANS(COALESCE(dl.latitude, d.last_latitude, 0)))
+                    )
+                ) AS distance_km
             FROM drivers d
             LEFT JOIN driver_locations dl ON d.id = dl.driver_id
             WHERE d.status = 'active'
-            AND (dl.status IN ('online', 'busy') OR d.status = 'active' OR dl.status IS NULL)
-            AND TIMESTAMPDIFF(MINUTE, COALESCE(dl.last_update, d.last_location_update, NOW()), NOW()) < 30
-            ORDER BY d.full_name ASC
+            HAVING distance_km <= ?
+            ORDER BY distance_km ASC
         `;
         
-        const [rows] = await pool.execute(query);
+        const [rows] = await pool.execute(query, [lat, lng, lat, radius]);
         return rows;
     } catch (error) {
-        console.error('❌ Failed to get all drivers:', error.message);
+        console.error('❌ Failed to get nearby drivers:', error.message);
         return [];
     }
 }
@@ -369,16 +455,24 @@ wss.on('connection', (ws, req) => {
     }));
     
     // Immediately send all drivers to the new client
+    console.log('📨 Fetching drivers for new client...');
     getAllDrivers().then(drivers => {
+        console.log(`📨 Sending ${drivers.length} drivers to new client`);
         ws.send(JSON.stringify({
             type: 'all_drivers',
             drivers: drivers,
             count: drivers.length,
             timestamp: new Date().toISOString()
         }));
-        console.log(`📨 Sent ${drivers.length} drivers to new client`);
     }).catch(error => {
         console.error('❌ Failed to send drivers to new client:', error.message);
+        ws.send(JSON.stringify({
+            type: 'all_drivers',
+            drivers: [],
+            count: 0,
+            error: error.message,
+            timestamp: new Date().toISOString()
+        }));
     });
     
     ws.on('message', async (data) => {
@@ -545,51 +639,14 @@ wss.on('connection', (ws, req) => {
                     }
                     
                     try {
-                        const query = `
-                            SELECT 
-                                d.id,
-                                d.full_name,
-                                d.rating,
-                                d.total_trips,
-                                d.driver_type,
-                                d.vehicle_make,
-                                d.vehicle_model,
-                                d.vehicle_color,
-                                d.vehicle_plate,
-                                d.rate_per_km,
-                                d.vehicle_rate_per_km,
-                                d.display_rate,
-                                d.front_image,
-                                d.back_image,
-                                d.side_image,
-                                COALESCE(dl.latitude, d.last_latitude, 0) as latitude,
-                                COALESCE(dl.longitude, d.last_longitude, 0) as longitude,
-                                COALESCE(dl.status, 'offline') as status,
-                                dl.last_update,
-                                (
-                                    6371 * ACOS(
-                                        COS(RADIANS(?)) * COS(RADIANS(COALESCE(dl.latitude, d.last_latitude, 0))) * 
-                                        COS(RADIANS(COALESCE(dl.longitude, d.last_longitude, 0)) - RADIANS(?)) + 
-                                        SIN(RADIANS(?)) * SIN(RADIANS(COALESCE(dl.latitude, d.last_latitude, 0)))
-                                    )
-                                ) AS distance_km
-                            FROM drivers d
-                            LEFT JOIN driver_locations dl ON d.id = dl.driver_id
-                            WHERE d.status = 'active'
-                            AND (dl.status IN ('online', 'busy') OR d.status = 'active' OR dl.status IS NULL)
-                            AND TIMESTAMPDIFF(MINUTE, COALESCE(dl.last_update, d.last_location_update, NOW()), NOW()) < 30
-                            HAVING distance_km <= ?
-                            ORDER BY distance_km ASC
-                        `;
+                        const nearbyDrivers = await getNearbyDrivers(lat, lng, radius);
                         
-                        const [rows] = await pool.execute(query, [lat, lng, lat, radius]);
-                        
-                        console.log(`✅ Found ${rows.length} nearby drivers`);
+                        console.log(`✅ Found ${nearbyDrivers.length} nearby drivers`);
                         
                         ws.send(JSON.stringify({
                             type: 'nearby_drivers',
-                            drivers: rows,
-                            count: rows.length,
+                            drivers: nearbyDrivers,
+                            count: nearbyDrivers.length,
                             timestamp: new Date().toISOString()
                         }));
                     } catch (error) {
@@ -716,14 +773,16 @@ setInterval(async () => {
             timestamp: new Date().toISOString()
         });
         
+        let clientsSent = 0;
         wss.clients.forEach((client) => {
             if (client.readyState === WebSocket.OPEN) {
                 client.send(message);
+                clientsSent++;
             }
         });
         
         if (allDrivers.length > 0) {
-            console.log(`📡 Broadcasted ${allDrivers.length} drivers to all clients`);
+            console.log(`📡 Broadcasted ${allDrivers.length} drivers to ${clientsSent} clients`);
         }
     } catch (error) {
         console.error('❌ Failed to broadcast drivers:', error.message);
@@ -746,6 +805,7 @@ async function startServer() {
         console.log(`🚗 Drivee WebSocket Server running on port ${PORT}`);
         console.log(`📍 WebSocket URL: ws://localhost:${PORT}`);
         console.log(`📊 Health check: http://localhost:${PORT}/health`);
+        console.log(`🔍 Debug drivers: http://localhost:${PORT}/debug-drivers`);
         console.log('✅ Server ready');
         console.log('🟢 Auto-offline is DISABLED - Drivers stay online until manual disconnect');
         console.log('🔵 Subscription monitoring is ENABLED - Only expired subscriptions are auto-offline');
