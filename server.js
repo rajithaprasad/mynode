@@ -1,9 +1,9 @@
-// server.js - Complete WebSocket Server with FIXED Database Query
+// server.js - Complete WebSocket Server with Dynamic Column Detection
 const WebSocket = require('ws');
 const mysql = require('mysql2/promise');
 const http = require('http');
 
-// Database configuration - SAME as your working PHP
+// Database configuration
 const dbConfig = {
     host: process.env.DB_HOST || 'srv657.hstgr.io',
     user: process.env.DB_USER || 'u442108067_rajithawalpola',
@@ -22,7 +22,6 @@ console.log('📊 Database Config:', {
 
 // Create HTTP server
 const server = http.createServer((req, res) => {
-    // CORS headers
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
@@ -90,7 +89,24 @@ const connectedDrivers = new Map();
 
 // Database connection pool
 let pool = null;
+let driverColumns = [];
 
+// ============================================================
+// GET TABLE COLUMNS
+// ============================================================
+async function getTableColumns(tableName) {
+    try {
+        const [columns] = await pool.execute(`SHOW COLUMNS FROM ${tableName}`);
+        return columns.map(col => col.Field);
+    } catch (error) {
+        console.error(`❌ Failed to get columns for ${tableName}:`, error.message);
+        return [];
+    }
+}
+
+// ============================================================
+// INIT DATABASE
+// ============================================================
 async function initDatabase() {
     try {
         pool = mysql.createPool(dbConfig);
@@ -99,6 +115,10 @@ async function initDatabase() {
         const connection = await pool.getConnection();
         console.log('✅ Database connected successfully');
         connection.release();
+        
+        // Get driver table columns
+        driverColumns = await getTableColumns('drivers');
+        console.log('📊 Driver table columns:', driverColumns);
         
         return true;
     } catch (error) {
@@ -109,7 +129,69 @@ async function initDatabase() {
 }
 
 // ============================================================
-// DEBUG DATABASE - Shows all tables and data
+// BUILD DYNAMIC SELECT QUERY
+// ============================================================
+function buildDriverSelectQuery() {
+    // Always include these base columns
+    const baseColumns = [
+        'd.id',
+        'd.full_name',
+        'd.rating',
+        'd.total_trips',
+        'd.status as driver_status'
+    ];
+    
+    // Optional columns - check if they exist
+    const optionalColumns = [
+        'driver_type',
+        'rate_per_km',
+        'vehicle_rate_per_km',
+        'vehicle_make',
+        'vehicle_model',
+        'vehicle_color',
+        'vehicle_plate',
+        'front_image',
+        'back_image',
+        'side_image',
+        'profile_image',
+        'display_rate'
+    ];
+    
+    const selectColumns = [...baseColumns];
+    
+    optionalColumns.forEach(col => {
+        if (driverColumns.includes(col)) {
+            selectColumns.push(`d.${col}`);
+        } else {
+            // Add default value if column doesn't exist
+            if (col === 'driver_type') selectColumns.push("'own_vehicle' as driver_type");
+            else if (col === 'rate_per_km') selectColumns.push("40 as rate_per_km");
+            else if (col === 'vehicle_rate_per_km') selectColumns.push("40 as vehicle_rate_per_km");
+            else if (col === 'display_rate') selectColumns.push("40 as display_rate");
+            else if (col === 'vehicle_make') selectColumns.push("'Toyota' as vehicle_make");
+            else if (col === 'vehicle_model') selectColumns.push("'Camry' as vehicle_model");
+            else if (col === 'vehicle_color') selectColumns.push("'Pearl White' as vehicle_color");
+            else if (col === 'vehicle_plate') selectColumns.push("'WP CAR-7823' as vehicle_plate");
+            else if (col === 'front_image') selectColumns.push("NULL as front_image");
+            else if (col === 'back_image') selectColumns.push("NULL as back_image");
+            else if (col === 'side_image') selectColumns.push("NULL as side_image");
+            else if (col === 'profile_image') selectColumns.push("NULL as profile_image");
+        }
+    });
+    
+    // Add location columns
+    selectColumns.push(`
+        COALESCE(dl.latitude, d.last_latitude, 0) as latitude,
+        COALESCE(dl.longitude, d.last_longitude, 0) as longitude,
+        COALESCE(dl.status, 'online') as status,
+        dl.last_update
+    `);
+    
+    return selectColumns.join(', ');
+}
+
+// ============================================================
+// DEBUG DATABASE
 // ============================================================
 async function debugDatabase() {
     if (!pool) {
@@ -119,66 +201,33 @@ async function debugDatabase() {
     const result = {
         success: true,
         timestamp: new Date().toISOString(),
-        tables: {},
+        columns: driverColumns,
         drivers: [],
         count: 0
     };
     
     try {
-        // Show all tables
-        const [tables] = await pool.execute("SHOW TABLES");
-        result.tables.all = tables.map(row => Object.values(row)[0]);
-        
-        // Show drivers table structure
-        try {
-            const [columns] = await pool.execute("DESCRIBE drivers");
-            result.tables.drivers_structure = columns;
-        } catch (e) {
-            result.tables.drivers_structure_error = e.message;
-        }
-        
-        // Count all drivers
-        const [countResult] = await pool.execute("SELECT COUNT(*) as total FROM drivers");
-        result.total_drivers = countResult[0].total;
-        
         // Count active drivers
         const [activeCount] = await pool.execute("SELECT COUNT(*) as total FROM drivers WHERE status = 'active'");
         result.active_drivers = activeCount[0].total;
         
-        // Get all drivers with their locations - EXACT same query as your PHP
+        // Get all drivers with dynamic columns
+        const selectColumns = buildDriverSelectQuery();
         const query = `
-            SELECT 
-                d.id,
-                d.full_name,
-                d.rating,
-                d.total_trips,
-                d.driver_type,
-                d.vehicle_make,
-                d.vehicle_model,
-                d.vehicle_color,
-                d.vehicle_plate,
-                d.rate_per_km,
-                d.vehicle_rate_per_km,
-                d.display_rate,
-                d.front_image,
-                d.back_image,
-                d.side_image,
-                d.status as driver_status,
-                COALESCE(dl.latitude, d.last_latitude, 0) as latitude,
-                COALESCE(dl.longitude, d.last_longitude, 0) as longitude,
-                COALESCE(dl.status, 'online') as status,
-                dl.last_update
+            SELECT ${selectColumns}
             FROM drivers d
             LEFT JOIN driver_locations dl ON d.id = dl.driver_id
             WHERE d.status = 'active'
             ORDER BY d.full_name ASC
         `;
         
+        console.log('📝 Debug query:', query);
+        
         const [rows] = await pool.execute(query);
         result.drivers = rows;
         result.count = rows.length;
         
-        // Also try a simpler query to see if any drivers exist
+        // Also get simple list
         const [simpleRows] = await pool.execute("SELECT id, full_name, status FROM drivers LIMIT 10");
         result.simple_drivers = simpleRows;
         
@@ -193,7 +242,7 @@ async function debugDatabase() {
 }
 
 // ============================================================
-// GET ALL DRIVERS - EXACTLY MATCHING YOUR PHP API
+// GET ALL DRIVERS - DYNAMIC QUERY
 // ============================================================
 async function getAllDrivers() {
     if (!pool) {
@@ -202,29 +251,9 @@ async function getAllDrivers() {
     }
     
     try {
-        // EXACT same query as your working get-all-drivers.php
+        const selectColumns = buildDriverSelectQuery();
         const query = `
-            SELECT 
-                d.id,
-                d.full_name,
-                d.rating,
-                d.total_trips,
-                d.driver_type,
-                d.vehicle_make,
-                d.vehicle_model,
-                d.vehicle_color,
-                d.vehicle_plate,
-                d.rate_per_km,
-                d.vehicle_rate_per_km,
-                d.display_rate,
-                d.front_image,
-                d.back_image,
-                d.side_image,
-                d.status as driver_status,
-                COALESCE(dl.latitude, d.last_latitude, 0) as latitude,
-                COALESCE(dl.longitude, d.last_longitude, 0) as longitude,
-                COALESCE(dl.status, 'online') as status,
-                dl.last_update
+            SELECT ${selectColumns}
             FROM drivers d
             LEFT JOIN driver_locations dl ON d.id = dl.driver_id
             WHERE d.status = 'active'
