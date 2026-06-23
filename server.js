@@ -1,4 +1,4 @@
-// server.js - Complete WebSocket Server with Dynamic Column Detection
+// server.js - Complete WebSocket Server with Live Location Updates
 const WebSocket = require('ws');
 const mysql = require('mysql2/promise');
 const http = require('http');
@@ -37,7 +37,8 @@ const server = http.createServer((req, res) => {
         res.end(JSON.stringify({ 
             status: 'healthy', 
             timestamp: new Date().toISOString(),
-            connections: wss ? wss.clients.size : 0
+            connections: wss ? wss.clients.size : 0,
+            connectedDrivers: connectedDrivers.size
         }));
         return;
     }
@@ -56,6 +57,25 @@ const server = http.createServer((req, res) => {
         return;
     }
     
+    if (req.url === '/connected-drivers') {
+        const drivers = [];
+        connectedDrivers.forEach((data, id) => {
+            drivers.push({
+                driver_id: id,
+                location: data.location,
+                lastUpdate: data.lastUpdate,
+                isOnline: data.isOnline
+            });
+        });
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+            success: true,
+            count: drivers.length,
+            drivers: drivers
+        }));
+        return;
+    }
+    
     if (req.url === '/') {
         res.writeHead(200, { 'Content-Type': 'text/html' });
         res.end(`
@@ -66,11 +86,13 @@ const server = http.createServer((req, res) => {
                 <h1>🚗 Drivee WebSocket Server</h1>
                 <p>Status: Running</p>
                 <p>Active Connections: ${wss ? wss.clients.size : 0}</p>
+                <p>Connected Drivers: ${connectedDrivers.size}</p>
                 <p>WebSocket URL: ws://${req.headers.host}</p>
                 <hr>
                 <p>Database: ${dbConfig.database}</p>
                 <p>Host: ${dbConfig.host}</p>
                 <p><a href="/debug-drivers">🔍 Debug: View All Drivers</a></p>
+                <p><a href="/connected-drivers">🔗 Connected Drivers</a></p>
             </body>
             </html>
         `);
@@ -84,8 +106,10 @@ const server = http.createServer((req, res) => {
 // Create WebSocket server
 const wss = new WebSocket.Server({ server });
 
-// Store connected drivers
+// Store connected drivers with their WebSocket connections
 const connectedDrivers = new Map();
+// Store all clients (passengers) for broadcasting
+const allClients = new Set();
 
 // Database connection pool
 let pool = null;
@@ -132,7 +156,6 @@ async function initDatabase() {
 // BUILD DYNAMIC SELECT QUERY
 // ============================================================
 function buildDriverSelectQuery() {
-    // Always include these base columns
     const baseColumns = [
         'd.id',
         'd.full_name',
@@ -141,20 +164,12 @@ function buildDriverSelectQuery() {
         'd.status as driver_status'
     ];
     
-    // Optional columns - check if they exist
     const optionalColumns = [
         'driver_type',
         'rate_per_km',
         'vehicle_rate_per_km',
-        'vehicle_make',
-        'vehicle_model',
-        'vehicle_color',
-        'vehicle_plate',
-        'front_image',
-        'back_image',
-        'side_image',
-        'profile_image',
-        'display_rate'
+        'display_rate',
+        'profile_image'
     ];
     
     const selectColumns = [...baseColumns];
@@ -163,27 +178,32 @@ function buildDriverSelectQuery() {
         if (driverColumns.includes(col)) {
             selectColumns.push(`d.${col}`);
         } else {
-            // Add default value if column doesn't exist
             if (col === 'driver_type') selectColumns.push("'own_vehicle' as driver_type");
             else if (col === 'rate_per_km') selectColumns.push("40 as rate_per_km");
             else if (col === 'vehicle_rate_per_km') selectColumns.push("40 as vehicle_rate_per_km");
             else if (col === 'display_rate') selectColumns.push("40 as display_rate");
-            else if (col === 'vehicle_make') selectColumns.push("'Toyota' as vehicle_make");
-            else if (col === 'vehicle_model') selectColumns.push("'Camry' as vehicle_model");
-            else if (col === 'vehicle_color') selectColumns.push("'Pearl White' as vehicle_color");
-            else if (col === 'vehicle_plate') selectColumns.push("'WP CAR-7823' as vehicle_plate");
-            else if (col === 'front_image') selectColumns.push("NULL as front_image");
-            else if (col === 'back_image') selectColumns.push("NULL as back_image");
-            else if (col === 'side_image') selectColumns.push("NULL as side_image");
             else if (col === 'profile_image') selectColumns.push("NULL as profile_image");
         }
     });
+    
+    // Add vehicle columns with COALESCE to handle NULLs
+    selectColumns.push(`
+        COALESCE(v.make, 'Toyota') as vehicle_make,
+        COALESCE(v.model, 'Camry') as vehicle_model,
+        COALESCE(v.year, '2021') as vehicle_year,
+        COALESCE(v.color, 'Pearl White') as vehicle_color,
+        COALESCE(v.plate, 'WP CAR-7823') as vehicle_plate,
+        v.front_image,
+        v.back_image,
+        v.side_image,
+        v.image_url
+    `);
     
     // Add location columns
     selectColumns.push(`
         COALESCE(dl.latitude, d.last_latitude, 0) as latitude,
         COALESCE(dl.longitude, d.last_longitude, 0) as longitude,
-        COALESCE(dl.status, 'online') as status,
+        COALESCE(dl.status, 'offline') as status,
         dl.last_update
     `);
     
@@ -207,16 +227,15 @@ async function debugDatabase() {
     };
     
     try {
-        // Count active drivers
         const [activeCount] = await pool.execute("SELECT COUNT(*) as total FROM drivers WHERE status = 'active'");
         result.active_drivers = activeCount[0].total;
         
-        // Get all drivers with dynamic columns
         const selectColumns = buildDriverSelectQuery();
         const query = `
             SELECT ${selectColumns}
             FROM drivers d
             LEFT JOIN driver_locations dl ON d.id = dl.driver_id
+            LEFT JOIN vehicles v ON d.vehicle_id = v.id
             WHERE d.status = 'active'
             ORDER BY d.full_name ASC
         `;
@@ -227,7 +246,6 @@ async function debugDatabase() {
         result.drivers = rows;
         result.count = rows.length;
         
-        // Also get simple list
         const [simpleRows] = await pool.execute("SELECT id, full_name, status FROM drivers LIMIT 10");
         result.simple_drivers = simpleRows;
         
@@ -256,6 +274,7 @@ async function getAllDrivers() {
             SELECT ${selectColumns}
             FROM drivers d
             LEFT JOIN driver_locations dl ON d.id = dl.driver_id
+            LEFT JOIN vehicles v ON d.vehicle_id = v.id
             WHERE d.status = 'active'
             ORDER BY d.full_name ASC
         `;
@@ -265,15 +284,141 @@ async function getAllDrivers() {
         
         console.log(`✅ Found ${rows.length} total drivers in database`);
         
-        if (rows.length > 0) {
-            console.log('📊 First driver:', JSON.stringify(rows[0]));
+        // Enhance with live location if available
+        const enhancedRows = rows.map(row => {
+            const driverId = row.id;
+            if (connectedDrivers.has(driverId)) {
+                const liveData = connectedDrivers.get(driverId);
+                if (liveData.location) {
+                    return {
+                        ...row,
+                        latitude: liveData.location.latitude || row.latitude,
+                        longitude: liveData.location.longitude || row.longitude,
+                        status: liveData.location.status || row.status,
+                        is_live: true
+                    };
+                }
+            }
+            return row;
+        });
+        
+        if (enhancedRows.length > 0) {
+            console.log('📊 First driver:', JSON.stringify(enhancedRows[0]));
         }
         
-        return rows;
+        return enhancedRows;
     } catch (error) {
         console.error('❌ Failed to get all drivers:', error.message);
         console.error('❌ Error details:', error);
         return [];
+    }
+}
+
+// ============================================================
+// SEND DRIVERS TO ALL CLIENTS
+// ============================================================
+async function broadcastAllDrivers() {
+    try {
+        const allDrivers = await getAllDrivers();
+        
+        // Enhance with live locations from connected drivers
+        const enhancedDrivers = allDrivers.map(driver => {
+            if (connectedDrivers.has(driver.id)) {
+                const liveData = connectedDrivers.get(driver.id);
+                if (liveData && liveData.location) {
+                    return {
+                        ...driver,
+                        latitude: liveData.location.latitude || driver.latitude,
+                        longitude: liveData.location.longitude || driver.longitude,
+                        status: liveData.location.status || driver.status,
+                        is_live: true,
+                        last_location_update: liveData.lastUpdate
+                    };
+                }
+            }
+            return driver;
+        });
+        
+        const message = JSON.stringify({
+            type: 'all_drivers',
+            drivers: enhancedDrivers,
+            count: enhancedDrivers.length,
+            timestamp: new Date().toISOString()
+        });
+        
+        let clientsSent = 0;
+        allClients.forEach((client) => {
+            if (client.readyState === WebSocket.OPEN) {
+                client.send(message);
+                clientsSent++;
+            }
+        });
+        
+        if (enhancedDrivers.length > 0) {
+            console.log(`📡 Broadcasted ${enhancedDrivers.length} drivers to ${clientsSent} clients`);
+        }
+    } catch (error) {
+        console.error('❌ Failed to broadcast drivers:', error.message);
+    }
+}
+
+// ============================================================
+// BROADCAST LOCATION UPDATE TO ALL CLIENTS
+// ============================================================
+function broadcastLocationUpdate(driverId, location) {
+    const message = JSON.stringify({
+        type: 'driver_location_update',
+        driver_id: driverId,
+        location: location,
+        timestamp: new Date().toISOString()
+    });
+    
+    let clientsSent = 0;
+    allClients.forEach((client) => {
+        if (client.readyState === WebSocket.OPEN) {
+            client.send(message);
+            clientsSent++;
+        }
+    });
+    
+    console.log(`📍 Location update for driver ${driverId} sent to ${clientsSent} clients`);
+}
+
+// ============================================================
+// UPDATE DRIVER LOCATION IN DATABASE
+// ============================================================
+async function updateDriverLocationInDB(driverId, location) {
+    if (!pool) return;
+    
+    try {
+        const { latitude, longitude, status = 'online' } = location;
+        
+        // Check if driver_locations record exists
+        const [existing] = await pool.execute(
+            "SELECT id FROM driver_locations WHERE driver_id = ?",
+            [driverId]
+        );
+        
+        if (existing.length > 0) {
+            // Update existing record
+            await pool.execute(
+                `UPDATE driver_locations 
+                 SET latitude = ?, longitude = ?, status = ?, last_update = NOW() 
+                 WHERE driver_id = ?`,
+                [latitude, longitude, status, driverId]
+            );
+        } else {
+            // Insert new record
+            await pool.execute(
+                `INSERT INTO driver_locations (driver_id, latitude, longitude, status, last_update) 
+                 VALUES (?, ?, ?, ?, NOW())`,
+                [driverId, latitude, longitude, status]
+            );
+        }
+        
+        console.log(`✅ Location saved to database for driver ${driverId}`);
+    } catch (error) {
+        console.error(`❌ Failed to save location for driver ${driverId}:`, error.message);
     }
 }
 
@@ -284,26 +429,33 @@ wss.on('connection', (ws, req) => {
     console.log('🟢 New client connected');
     let driverId = null;
     let isDriver = false;
+    let clientId = Math.random().toString(36).substring(7);
+    
+    // Add to all clients
+    allClients.add(ws);
+    console.log(`📊 Total clients: ${allClients.size}`);
     
     // Send welcome message
     ws.send(JSON.stringify({
         type: 'welcome',
         message: 'Connected to Drivee WebSocket Server',
+        clientId: clientId,
         timestamp: new Date().toISOString()
     }));
     
-    // Immediately send all drivers to the new client
+    // Immediately send all drivers
     console.log('📨 Fetching drivers for new client...');
     getAllDrivers().then(drivers => {
-        console.log(`📨 Sending ${drivers.length} drivers to new client`);
-        ws.send(JSON.stringify({
+        const message = JSON.stringify({
             type: 'all_drivers',
             drivers: drivers,
             count: drivers.length,
             timestamp: new Date().toISOString()
-        }));
+        });
+        ws.send(message);
+        console.log(`📨 Sent ${drivers.length} drivers to new client`);
     }).catch(error => {
-        console.error('❌ Failed to send drivers to new client:', error.message);
+        console.error('❌ Failed to send drivers:', error.message);
         ws.send(JSON.stringify({
             type: 'all_drivers',
             drivers: [],
@@ -316,33 +468,18 @@ wss.on('connection', (ws, req) => {
     ws.on('message', async (data) => {
         try {
             const message = JSON.parse(data.toString());
-            console.log('📨 Received:', message.type);
+            console.log(`📨 Received [${message.type}] from ${isDriver ? 'Driver' : 'Client'}`);
             
             switch (message.type) {
                 case 'get_all_drivers':
-                    console.log('🔍 Getting ALL drivers from database...');
-                    
-                    try {
-                        const allDrivers = await getAllDrivers();
-                        
-                        console.log(`✅ Found ${allDrivers.length} total drivers`);
-                        
-                        ws.send(JSON.stringify({
-                            type: 'all_drivers',
-                            drivers: allDrivers,
-                            count: allDrivers.length,
-                            timestamp: new Date().toISOString()
-                        }));
-                    } catch (error) {
-                        console.error('❌ Failed to get all drivers:', error.message);
-                        ws.send(JSON.stringify({
-                            type: 'all_drivers',
-                            drivers: [],
-                            count: 0,
-                            error: error.message,
-                            timestamp: new Date().toISOString()
-                        }));
-                    }
+                    console.log('🔍 Getting ALL drivers...');
+                    const allDrivers = await getAllDrivers();
+                    ws.send(JSON.stringify({
+                        type: 'all_drivers',
+                        drivers: allDrivers,
+                        count: allDrivers.length,
+                        timestamp: new Date().toISOString()
+                    }));
                     break;
                     
                 case 'driver_register':
@@ -357,25 +494,34 @@ wss.on('connection', (ws, req) => {
                         return;
                     }
                     
+                    // Store driver with their WebSocket
                     connectedDrivers.set(driverId, {
                         ws: ws,
                         location: null,
-                        lastUpdate: Date.now()
+                        lastUpdate: Date.now(),
+                        isOnline: true,
+                        clientId: clientId
                     });
                     
-                    console.log(`✅ Driver ${driverId} registered`);
+                    console.log(`✅ Driver ${driverId} registered (${clientId})`);
+                    console.log(`📊 Connected drivers: ${connectedDrivers.size}`);
                     
+                    // Send registration success
                     ws.send(JSON.stringify({
                         type: 'registration_success',
                         driver_id: driverId,
                         message: 'Driver registered successfully'
                     }));
+                    
+                    // Broadcast updated driver list to all clients
+                    await broadcastAllDrivers();
                     break;
                     
                 case 'driver_location_update':
                     const updateDriverId = message.driver_id;
+                    const location = message.location;
                     
-                    if (!updateDriverId || !message.location) {
+                    if (!updateDriverId || !location) {
                         ws.send(JSON.stringify({
                             type: 'error',
                             message: 'Missing driver_id or location data'
@@ -383,34 +529,60 @@ wss.on('connection', (ws, req) => {
                         return;
                     }
                     
+                    // Update in memory
                     if (connectedDrivers.has(updateDriverId)) {
                         const driverData = connectedDrivers.get(updateDriverId);
-                        driverData.location = message.location;
+                        driverData.location = location;
                         driverData.lastUpdate = Date.now();
                         connectedDrivers.set(updateDriverId, driverData);
+                        console.log(`📍 Location updated for driver ${updateDriverId}: ${location.latitude}, ${location.longitude}`);
+                    } else {
+                        console.log(`⚠️ Driver ${updateDriverId} not registered, but storing location`);
+                        connectedDrivers.set(updateDriverId, {
+                            ws: ws,
+                            location: location,
+                            lastUpdate: Date.now(),
+                            isOnline: true,
+                            clientId: clientId
+                        });
                     }
                     
-                    // Broadcast to all clients
-                    const locationMsg = JSON.stringify({
-                        type: 'driver_location_update',
-                        driver_id: updateDriverId,
-                        location: message.location,
-                        timestamp: new Date().toISOString()
-                    });
+                    // SAVE TO DATABASE - CRITICAL FOR PERSISTENCE
+                    await updateDriverLocationInDB(updateDriverId, location);
                     
-                    wss.clients.forEach((client) => {
-                        if (client !== ws && client.readyState === WebSocket.OPEN) {
-                            client.send(locationMsg);
-                        }
-                    });
+                    // BROADCAST TO ALL CLIENTS (Passengers)
+                    broadcastLocationUpdate(updateDriverId, location);
                     
+                    // Send acknowledgment to driver
                     ws.send(JSON.stringify({
                         type: 'location_ack',
                         driver_id: updateDriverId,
                         timestamp: new Date().toISOString()
                     }));
+                    break;
                     
-                    console.log(`✅ Location updated for driver ${updateDriverId}`);
+                case 'driver_offline':
+                    const offlineDriverId = message.driver_id;
+                    if (offlineDriverId && connectedDrivers.has(offlineDriverId)) {
+                        const driverData = connectedDrivers.get(offlineDriverId);
+                        driverData.isOnline = false;
+                        driverData.location = { ...driverData.location, status: 'offline' };
+                        connectedDrivers.set(offlineDriverId, driverData);
+                        
+                        // Update database
+                        await updateDriverLocationInDB(offlineDriverId, { 
+                            ...driverData.location, 
+                            status: 'offline' 
+                        });
+                        
+                        // Broadcast offline status
+                        broadcastLocationUpdate(offlineDriverId, { 
+                            ...driverData.location, 
+                            status: 'offline' 
+                        });
+                        
+                        console.log(`🔴 Driver ${offlineDriverId} went offline`);
+                    }
                     break;
                     
                 case 'get_nearby_drivers':
@@ -428,7 +600,6 @@ wss.on('connection', (ws, req) => {
                     try {
                         const allDrivers = await getAllDrivers();
                         
-                        // Filter by distance
                         const nearby = allDrivers.filter(d => {
                             const distance = calculateDistance(lat, lng, d.latitude, d.longitude);
                             return distance <= radius;
@@ -473,17 +644,31 @@ wss.on('connection', (ws, req) => {
             console.error('❌ Error processing message:', error.message);
             ws.send(JSON.stringify({
                 type: 'error',
-                message: 'Failed to process message'
+                message: 'Failed to process message: ' + error.message
             }));
         }
     });
     
     ws.on('close', () => {
         console.log('🔴 Client disconnected');
+        
+        // Remove from all clients
+        allClients.delete(ws);
+        
+        // If it was a driver, clean up
         if (driverId && isDriver) {
-            connectedDrivers.delete(driverId);
-            console.log(`🔴 Driver ${driverId} removed from connected list`);
+            // Don't delete immediately - keep the driver in memory but mark offline
+            if (connectedDrivers.has(driverId)) {
+                const driverData = connectedDrivers.get(driverId);
+                driverData.isOnline = false;
+                driverData.ws = null;
+                connectedDrivers.set(driverId, driverData);
+                console.log(`🔴 Driver ${driverId} disconnected but keeping location`);
+            }
         }
+        
+        console.log(`📊 Total clients: ${allClients.size}`);
+        console.log(`📊 Connected drivers: ${connectedDrivers.size}`);
     });
     
     ws.on('error', (error) => {
@@ -506,33 +691,29 @@ function calculateDistance(lat1, lng1, lat2, lng2) {
 }
 
 // ============================================================
-// PERIODIC BROADCAST ALL DRIVERS
+// PERIODIC BROADCAST ALL DRIVERS (for new passengers)
 // ============================================================
 setInterval(async () => {
     try {
-        const allDrivers = await getAllDrivers();
-        
-        const message = JSON.stringify({
-            type: 'all_drivers',
-            drivers: allDrivers,
-            count: allDrivers.length,
-            timestamp: new Date().toISOString()
-        });
-        
-        let clientsSent = 0;
-        wss.clients.forEach((client) => {
-            if (client.readyState === WebSocket.OPEN) {
-                client.send(message);
-                clientsSent++;
-            }
-        });
-        
-        if (allDrivers.length > 0) {
-            console.log(`📡 Broadcasted ${allDrivers.length} drivers to ${clientsSent} clients`);
-        }
+        await broadcastAllDrivers();
     } catch (error) {
         console.error('❌ Failed to broadcast drivers:', error.message);
     }
+}, 10000); // Every 10 seconds
+
+// ============================================================
+// CLEANUP STALE DRIVER CONNECTIONS
+// ============================================================
+setInterval(() => {
+    const now = Date.now();
+    const staleTimeout = 60000; // 60 seconds
+    
+    connectedDrivers.forEach((data, id) => {
+        if (!data.ws && (now - data.lastUpdate) > staleTimeout) {
+            connectedDrivers.delete(id);
+            console.log(`🧹 Removed stale driver ${id}`);
+        }
+    });
 }, 30000);
 
 // ============================================================
@@ -544,13 +725,14 @@ async function startServer() {
     const dbInitialized = await initDatabase();
     
     if (!dbInitialized) {
-        console.error('❌ Failed to initialize database.');
+        console.warn('⚠️ Database not initialized, but server will continue');
     }
     
     server.listen(PORT, () => {
         console.log(`🚗 Drivee WebSocket Server running on port ${PORT}`);
         console.log(`📍 WebSocket URL: ws://localhost:${PORT}`);
         console.log(`🔍 Debug: http://localhost:${PORT}/debug-drivers`);
+        console.log(`🔗 Connected Drivers: http://localhost:${PORT}/connected-drivers`);
         console.log('✅ Server ready');
     });
 }
