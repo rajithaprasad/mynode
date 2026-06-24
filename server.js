@@ -1,4 +1,4 @@
-// server.js - Complete WebSocket Server with Live Location Updates
+// server.js - Complete WebSocket Server with Live Location Updates & Booking Subscriptions
 const WebSocket = require('ws');
 const mysql = require('mysql2/promise');
 const http = require('http');
@@ -73,6 +73,32 @@ const server = http.createServer((req, res) => {
             count: drivers.length,
             drivers: drivers
         }));
+        return;
+    }
+    
+    // Add endpoint to manually trigger booking status broadcast
+    if (req.url && req.url.startsWith('/broadcast-booking')) {
+        const url = new URL(req.url, `http://${req.headers.host}`);
+        const bookingId = url.searchParams.get('booking_id');
+        const status = url.searchParams.get('status');
+        const driverName = url.searchParams.get('driver_name');
+        
+        if (bookingId && status) {
+            broadcastBookingStatus(bookingId, status, driverName);
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({
+                success: true,
+                message: 'Booking status broadcasted',
+                booking_id: bookingId,
+                status: status
+            }));
+        } else {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({
+                success: false,
+                message: 'Missing booking_id or status'
+            }));
+        }
         return;
     }
     
@@ -385,6 +411,32 @@ function broadcastLocationUpdate(driverId, location) {
 }
 
 // ============================================================
+// BROADCAST BOOKING STATUS TO SUBSCRIBED CLIENTS
+// ============================================================
+function broadcastBookingStatus(bookingId, status, driverName) {
+    const message = JSON.stringify({
+        type: 'booking_status_update',
+        booking_id: bookingId,
+        status: status,
+        driver_name: driverName || null,
+        timestamp: new Date().toISOString()
+    });
+    
+    let clientsSent = 0;
+    allClients.forEach((client) => {
+        // Check if client has booking subscriptions
+        if (client.bookingSubscriptions && client.bookingSubscriptions.includes(bookingId)) {
+            if (client.readyState === WebSocket.OPEN) {
+                client.send(message);
+                clientsSent++;
+            }
+        }
+    });
+    
+    console.log(`📨 Booking status ${status} for ${bookingId} sent to ${clientsSent} clients`);
+}
+
+// ============================================================
 // UPDATE DRIVER LOCATION IN DATABASE
 // ============================================================
 async function updateDriverLocationInDB(driverId, location) {
@@ -430,6 +482,9 @@ wss.on('connection', (ws, req) => {
     let driverId = null;
     let isDriver = false;
     let clientId = Math.random().toString(36).substring(7);
+    
+    // Initialize booking subscriptions array
+    ws.bookingSubscriptions = [];
     
     // Add to all clients
     allClients.add(ws);
@@ -515,6 +570,37 @@ wss.on('connection', (ws, req) => {
                     
                     // Broadcast updated driver list to all clients
                     await broadcastAllDrivers();
+                    break;
+                    
+                case 'subscribe_booking':
+                    const bookingId = message.booking_id;
+                    console.log(`📨 Client subscribed to booking: ${bookingId}`);
+                    // Store the subscription
+                    if (!ws.bookingSubscriptions) {
+                        ws.bookingSubscriptions = [];
+                    }
+                    if (!ws.bookingSubscriptions.includes(bookingId)) {
+                        ws.bookingSubscriptions.push(bookingId);
+                    }
+                    ws.send(JSON.stringify({
+                        type: 'subscription_success',
+                        booking_id: bookingId,
+                        message: 'Subscribed to booking updates'
+                    }));
+                    break;
+                    
+                case 'unsubscribe_booking':
+                    const unsubBookingId = message.booking_id;
+                    if (ws.bookingSubscriptions) {
+                        ws.bookingSubscriptions = ws.bookingSubscriptions.filter(
+                            id => id !== unsubBookingId
+                        );
+                    }
+                    ws.send(JSON.stringify({
+                        type: 'unsubscription_success',
+                        booking_id: unsubBookingId,
+                        message: 'Unsubscribed from booking updates'
+                    }));
                     break;
                     
                 case 'driver_location_update':
