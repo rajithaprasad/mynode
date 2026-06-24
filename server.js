@@ -83,6 +83,8 @@ const server = http.createServer((req, res) => {
         const status = url.searchParams.get('status');
         const driverName = url.searchParams.get('driver_name');
         
+        console.log(`📨 Broadcast request received: booking_id=${bookingId}, status=${status}, driver_name=${driverName}`);
+        
         if (bookingId && status) {
             broadcastBookingStatus(bookingId, status, driverName);
             res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -414,6 +416,8 @@ function broadcastLocationUpdate(driverId, location) {
 // BROADCAST BOOKING STATUS TO SUBSCRIBED CLIENTS
 // ============================================================
 function broadcastBookingStatus(bookingId, status, driverName) {
+    console.log(`📨 Broadcasting booking status: booking_id=${bookingId}, status=${status}, driver_name=${driverName}`);
+    
     const message = JSON.stringify({
         type: 'booking_status_update',
         booking_id: bookingId,
@@ -423,17 +427,23 @@ function broadcastBookingStatus(bookingId, status, driverName) {
     });
     
     let clientsSent = 0;
+    let subscribedClients = 0;
+    
     allClients.forEach((client) => {
         // Check if client has booking subscriptions
-        if (client.bookingSubscriptions && client.bookingSubscriptions.includes(bookingId)) {
-            if (client.readyState === WebSocket.OPEN) {
-                client.send(message);
-                clientsSent++;
+        if (client.bookingSubscriptions && client.bookingSubscriptions.length > 0) {
+            subscribedClients++;
+            if (client.bookingSubscriptions.includes(bookingId)) {
+                if (client.readyState === WebSocket.OPEN) {
+                    client.send(message);
+                    clientsSent++;
+                    console.log(`📨 Sent to subscribed client ${client.clientId || 'unknown'}`);
+                }
             }
         }
     });
     
-    console.log(`📨 Booking status ${status} for ${bookingId} sent to ${clientsSent} clients`);
+    console.log(`📨 Booking status ${status} for ${bookingId} sent to ${clientsSent} clients (${subscribedClients} subscribed clients)`);
 }
 
 // ============================================================
@@ -485,6 +495,7 @@ wss.on('connection', (ws, req) => {
     
     // Initialize booking subscriptions array
     ws.bookingSubscriptions = [];
+    ws.clientId = clientId;
     
     // Add to all clients
     allClients.add(ws);
@@ -523,7 +534,7 @@ wss.on('connection', (ws, req) => {
     ws.on('message', async (data) => {
         try {
             const message = JSON.parse(data.toString());
-            console.log(`📨 Received [${message.type}] from ${isDriver ? 'Driver' : 'Client'}`);
+            console.log(`📨 Received [${message.type}] from ${isDriver ? 'Driver' : 'Client'} (${clientId})`);
             
             switch (message.type) {
                 case 'get_all_drivers':
@@ -574,7 +585,7 @@ wss.on('connection', (ws, req) => {
                     
                 case 'subscribe_booking':
                     const bookingId = message.booking_id;
-                    console.log(`📨 Client subscribed to booking: ${bookingId}`);
+                    console.log(`📨 Client ${clientId} subscribed to booking: ${bookingId}`);
                     // Store the subscription
                     if (!ws.bookingSubscriptions) {
                         ws.bookingSubscriptions = [];
@@ -587,6 +598,7 @@ wss.on('connection', (ws, req) => {
                         booking_id: bookingId,
                         message: 'Subscribed to booking updates'
                     }));
+                    console.log(`📨 Client ${clientId} now subscribed to: ${ws.bookingSubscriptions.join(', ')}`);
                     break;
                     
                 case 'unsubscribe_booking':
@@ -736,7 +748,7 @@ wss.on('connection', (ws, req) => {
     });
     
     ws.on('close', () => {
-        console.log('🔴 Client disconnected');
+        console.log(`🔴 Client ${clientId} disconnected`);
         
         // Remove from all clients
         allClients.delete(ws);
