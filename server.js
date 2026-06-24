@@ -427,23 +427,39 @@ function broadcastBookingStatus(bookingId, status, driverName) {
     });
     
     let clientsSent = 0;
-    let subscribedClients = 0;
+    let bookingSubscribedClients = 0;
+    let userSubscribedClients = 0;
     
     allClients.forEach((client) => {
+        let shouldSend = false;
+        let subscriptionType = '';
+        
         // Check if client has booking subscriptions
         if (client.bookingSubscriptions && client.bookingSubscriptions.length > 0) {
-            subscribedClients++;
             if (client.bookingSubscriptions.includes(bookingId)) {
-                if (client.readyState === WebSocket.OPEN) {
-                    client.send(message);
-                    clientsSent++;
-                    console.log(`📨 Sent to subscribed client ${client.clientId || 'unknown'}`);
-                }
+                shouldSend = true;
+                subscriptionType = 'booking';
+                bookingSubscribedClients++;
             }
+        }
+        
+        // Check if client has user subscriptions
+        if (client.userSubscriptions && client.userSubscriptions.length > 0) {
+            // For user subscriptions, we also send the update
+            // The client will filter based on their bookings
+            shouldSend = true;
+            subscriptionType = 'user';
+            userSubscribedClients++;
+        }
+        
+        if (shouldSend && client.readyState === WebSocket.OPEN) {
+            client.send(message);
+            clientsSent++;
+            console.log(`📨 Sent to ${subscriptionType} subscribed client ${client.clientId || 'unknown'}`);
         }
     });
     
-    console.log(`📨 Booking status ${status} for ${bookingId} sent to ${clientsSent} clients (${subscribedClients} subscribed clients)`);
+    console.log(`📨 Booking status ${status} for ${bookingId} sent to ${clientsSent} clients (${bookingSubscribedClients} booking subs, ${userSubscribedClients} user subs)`);
 }
 
 // ============================================================
@@ -493,8 +509,9 @@ wss.on('connection', (ws, req) => {
     let isDriver = false;
     let clientId = Math.random().toString(36).substring(7);
     
-    // Initialize booking subscriptions array
+    // Initialize subscription arrays
     ws.bookingSubscriptions = [];
+    ws.userSubscriptions = [];
     ws.clientId = clientId;
     
     // Add to all clients
@@ -598,7 +615,25 @@ wss.on('connection', (ws, req) => {
                         booking_id: bookingId,
                         message: 'Subscribed to booking updates'
                     }));
-                    console.log(`📨 Client ${clientId} now subscribed to: ${ws.bookingSubscriptions.join(', ')}`);
+                    console.log(`📨 Client ${clientId} booking subscriptions: ${ws.bookingSubscriptions.join(', ')}`);
+                    break;
+                    
+                case 'subscribe_user_bookings':
+                    const userId = message.user_id;
+                    console.log(`📨 Client ${clientId} subscribed to user bookings: ${userId}`);
+                    // Store the subscription
+                    if (!ws.userSubscriptions) {
+                        ws.userSubscriptions = [];
+                    }
+                    if (!ws.userSubscriptions.includes(userId)) {
+                        ws.userSubscriptions.push(userId);
+                    }
+                    ws.send(JSON.stringify({
+                        type: 'subscription_success',
+                        user_id: userId,
+                        message: 'Subscribed to user booking updates'
+                    }));
+                    console.log(`📨 Client ${clientId} user subscriptions: ${ws.userSubscriptions.join(', ')}`);
                     break;
                     
                 case 'unsubscribe_booking':
@@ -612,6 +647,20 @@ wss.on('connection', (ws, req) => {
                         type: 'unsubscription_success',
                         booking_id: unsubBookingId,
                         message: 'Unsubscribed from booking updates'
+                    }));
+                    break;
+                    
+                case 'unsubscribe_user_bookings':
+                    const unsubUserId = message.user_id;
+                    if (ws.userSubscriptions) {
+                        ws.userSubscriptions = ws.userSubscriptions.filter(
+                            id => id !== unsubUserId
+                        );
+                    }
+                    ws.send(JSON.stringify({
+                        type: 'unsubscription_success',
+                        user_id: unsubUserId,
+                        message: 'Unsubscribed from user booking updates'
                     }));
                     break;
                     
