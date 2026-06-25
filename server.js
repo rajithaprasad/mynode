@@ -82,11 +82,12 @@ const server = http.createServer((req, res) => {
         const bookingId = url.searchParams.get('booking_id');
         const status = url.searchParams.get('status');
         const driverName = url.searchParams.get('driver_name');
+        const driverId = url.searchParams.get('driver_id');
         
-        console.log(`📨 Broadcast request received: booking_id=${bookingId}, status=${status}, driver_name=${driverName}`);
+        console.log(`📨 Broadcast request received: booking_id=${bookingId}, status=${status}, driver_name=${driverName}, driver_id=${driverId}`);
         
         if (bookingId && status) {
-            broadcastBookingStatus(bookingId, status, driverName);
+            broadcastBookingStatus(bookingId, status, driverName, driverId);
             res.writeHead(200, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({
                 success: true,
@@ -415,14 +416,15 @@ function broadcastLocationUpdate(driverId, location) {
 // ============================================================
 // BROADCAST BOOKING STATUS TO SUBSCRIBED CLIENTS
 // ============================================================
-function broadcastBookingStatus(bookingId, status, driverName) {
-    console.log(`📨 Broadcasting booking status: booking_id=${bookingId}, status=${status}, driver_name=${driverName}`);
+function broadcastBookingStatus(bookingId, status, driverName, driverId) {
+    console.log(`📨 Broadcasting booking status: booking_id=${bookingId}, status=${status}, driver_name=${driverName}, driver_id=${driverId}`);
     
     const message = JSON.stringify({
         type: 'booking_status_update',
         booking_id: bookingId,
         status: status,
         driver_name: driverName || null,
+        driver_id: driverId || null,
         timestamp: new Date().toISOString()
     });
     
@@ -445,8 +447,6 @@ function broadcastBookingStatus(bookingId, status, driverName) {
         
         // Check if client has user subscriptions
         if (client.userSubscriptions && client.userSubscriptions.length > 0) {
-            // For user subscriptions, we also send the update
-            // The client will filter based on their bookings
             shouldSend = true;
             subscriptionType = 'user';
             userSubscribedClients++;
@@ -460,6 +460,45 @@ function broadcastBookingStatus(bookingId, status, driverName) {
     });
     
     console.log(`📨 Booking status ${status} for ${bookingId} sent to ${clientsSent} clients (${bookingSubscribedClients} booking subs, ${userSubscribedClients} user subs)`);
+}
+
+// ============================================================
+// BROADCAST BOOKING CANCELLED TO DRIVER
+// ============================================================
+function broadcastBookingCancelled(bookingId, driverId, passengerId) {
+    console.log(`📨 Broadcasting booking cancelled: booking_id=${bookingId}, driver_id=${driverId}, passenger_id=${passengerId}`);
+    
+    const message = JSON.stringify({
+        type: 'booking_cancelled_by_passenger',
+        booking_id: bookingId,
+        driver_id: driverId,
+        passenger_id: passengerId,
+        timestamp: new Date().toISOString()
+    });
+    
+    let clientsSent = 0;
+    
+    // Send specifically to the driver
+    if (driverId && connectedDrivers.has(driverId)) {
+        const driverData = connectedDrivers.get(driverId);
+        if (driverData.ws && driverData.ws.readyState === WebSocket.OPEN) {
+            driverData.ws.send(message);
+            clientsSent++;
+            console.log(`📨 Sent booking cancellation to driver ${driverId}`);
+        }
+    }
+    
+    // Also send to any clients subscribed to this booking
+    allClients.forEach((client) => {
+        if (client.bookingSubscriptions && client.bookingSubscriptions.includes(bookingId)) {
+            if (client.readyState === WebSocket.OPEN) {
+                client.send(message);
+                clientsSent++;
+            }
+        }
+    });
+    
+    console.log(`📨 Booking cancelled message sent to ${clientsSent} clients`);
 }
 
 // ============================================================
@@ -661,6 +700,26 @@ wss.on('connection', (ws, req) => {
                         type: 'unsubscription_success',
                         user_id: unsubUserId,
                         message: 'Unsubscribed from user booking updates'
+                    }));
+                    break;
+                    
+                case 'booking_cancelled':
+                    const cancelledBookingId = message.booking_id;
+                    const cancelledDriverId = message.driver_id;
+                    const cancelledPassengerId = message.passenger_id;
+                    
+                    console.log(`📨 Booking cancelled by passenger: ${cancelledBookingId}, driver: ${cancelledDriverId}`);
+                    
+                    // Broadcast to the driver specifically
+                    broadcastBookingCancelled(cancelledBookingId, cancelledDriverId, cancelledPassengerId);
+                    
+                    // Also broadcast to all subscribers
+                    broadcastBookingStatus(cancelledBookingId, 'cancelled', null, cancelledDriverId);
+                    
+                    ws.send(JSON.stringify({
+                        type: 'cancellation_ack',
+                        booking_id: cancelledBookingId,
+                        message: 'Cancellation broadcasted'
                     }));
                     break;
                     
