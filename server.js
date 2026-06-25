@@ -452,6 +452,17 @@ function broadcastBookingStatus(bookingId, status, driverName, driverId) {
             userSubscribedClients++;
         }
         
+        // Also send to driver if driver_id matches and they're connected
+        if (driverId && connectedDrivers.has(parseInt(driverId))) {
+            const driverData = connectedDrivers.get(parseInt(driverId));
+            if (driverData && driverData.ws && driverData.ws.readyState === WebSocket.OPEN) {
+                driverData.ws.send(message);
+                clientsSent++;
+                console.log(`📨 Sent booking status to driver ${driverId} directly`);
+                return; // Don't send twice
+            }
+        }
+        
         if (shouldSend && client.readyState === WebSocket.OPEN) {
             client.send(message);
             clientsSent++;
@@ -477,14 +488,23 @@ function broadcastBookingCancelled(bookingId, driverId, passengerId) {
     });
     
     let clientsSent = 0;
+    let driverFound = false;
     
     // Send specifically to the driver
-    if (driverId && connectedDrivers.has(driverId)) {
-        const driverData = connectedDrivers.get(driverId);
-        if (driverData.ws && driverData.ws.readyState === WebSocket.OPEN) {
-            driverData.ws.send(message);
-            clientsSent++;
-            console.log(`📨 Sent booking cancellation to driver ${driverId}`);
+    if (driverId) {
+        const driverIdNum = parseInt(driverId);
+        if (connectedDrivers.has(driverIdNum)) {
+            const driverData = connectedDrivers.get(driverIdNum);
+            if (driverData.ws && driverData.ws.readyState === WebSocket.OPEN) {
+                driverData.ws.send(message);
+                clientsSent++;
+                driverFound = true;
+                console.log(`📨 Sent booking cancellation to driver ${driverId} directly via WebSocket`);
+            } else {
+                console.log(`⚠️ Driver ${driverId} is connected but WebSocket is not open`);
+            }
+        } else {
+            console.log(`⚠️ Driver ${driverId} not found in connected drivers`);
         }
     }
     
@@ -498,7 +518,21 @@ function broadcastBookingCancelled(bookingId, driverId, passengerId) {
         }
     });
     
-    console.log(`📨 Booking cancelled message sent to ${clientsSent} clients`);
+    // Send to all drivers as a broadcast (for safety)
+    connectedDrivers.forEach((data, id) => {
+        if (data.ws && data.ws.readyState === WebSocket.OPEN && id !== parseInt(driverId)) {
+            // Send a generic booking cancelled message to all drivers
+            data.ws.send(JSON.stringify({
+                type: 'booking_removed',
+                booking_id: bookingId,
+                timestamp: new Date().toISOString()
+            }));
+            clientsSent++;
+        }
+    });
+    
+    console.log(`📨 Booking cancelled message sent to ${clientsSent} clients (driver found: ${driverFound})`);
+    return driverFound;
 }
 
 // ============================================================
@@ -711,7 +745,7 @@ wss.on('connection', (ws, req) => {
                     console.log(`📨 Booking cancelled by passenger: ${cancelledBookingId}, driver: ${cancelledDriverId}`);
                     
                     // Broadcast to the driver specifically
-                    broadcastBookingCancelled(cancelledBookingId, cancelledDriverId, cancelledPassengerId);
+                    const sent = broadcastBookingCancelled(cancelledBookingId, cancelledDriverId, cancelledPassengerId);
                     
                     // Also broadcast to all subscribers
                     broadcastBookingStatus(cancelledBookingId, 'cancelled', null, cancelledDriverId);
@@ -719,6 +753,7 @@ wss.on('connection', (ws, req) => {
                     ws.send(JSON.stringify({
                         type: 'cancellation_ack',
                         booking_id: cancelledBookingId,
+                        sent_to_driver: sent,
                         message: 'Cancellation broadcasted'
                     }));
                     break;
