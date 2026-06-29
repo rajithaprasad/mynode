@@ -536,6 +536,52 @@ function broadcastBookingCancelled(bookingId, driverId, passengerId) {
 }
 
 // ============================================================
+// BROADCAST NEW BOOKING TO DRIVERS (NEW FUNCTION)
+// ============================================================
+function broadcastNewBookingToDrivers(bookingData) {
+    console.log(`📨 Broadcasting new booking to drivers: ${bookingData.booking_id}`);
+    
+    const message = JSON.stringify({
+        type: 'new_booking',
+        booking: {
+            id: bookingData.id,
+            booking_id: bookingData.booking_id,
+            customer_name: bookingData.customer_name,
+            customer_rating: bookingData.customer_rating || 4.8,
+            customer_trips: bookingData.customer_trips || 0,
+            pickup: bookingData.pickup_address,
+            destination: bookingData.destination_address,
+            distance_to_pickup: bookingData.distance_to_pickup || '0.8 km',
+            time_to_pickup: bookingData.time_to_pickup || '3 min',
+            trip_distance: bookingData.trip_distance || '4.2 km',
+            trip_duration: bookingData.trip_duration || '15 min',
+            fare: bookingData.fare,
+            vehicle: {
+                make: bookingData.vehicle_make || 'Toyota',
+                model: bookingData.vehicle_model || 'Camry',
+                year: bookingData.vehicle_year || '2021',
+                color: bookingData.vehicle_color || 'Pearl White',
+                plate: bookingData.vehicle_plate || 'WP CAR-7823'
+            },
+            // NEW: Include scheduled date and time
+            scheduled_date: bookingData.scheduled_date || null,
+            scheduled_time: bookingData.scheduled_time || null,
+        },
+        timestamp: new Date().toISOString()
+    });
+
+    let driversSent = 0;
+    connectedDrivers.forEach((data, driverId) => {
+        if (data.ws && data.ws.readyState === WebSocket.OPEN) {
+            data.ws.send(message);
+            driversSent++;
+        }
+    });
+    
+    console.log(`📨 New booking broadcast sent to ${driversSent} drivers`);
+}
+
+// ============================================================
 // UPDATE DRIVER LOCATION IN DATABASE
 // ============================================================
 async function updateDriverLocationInDB(driverId, location) {
