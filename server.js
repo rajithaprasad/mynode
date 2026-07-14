@@ -79,16 +79,30 @@ app.get('/test-db', async (req, res) => {
     }
 });
 
-// ✅ FIXED: Socket.io authentication - Properly read userId from auth
+// ✅ FIXED: Socket.io authentication - CORRECTLY read userId from auth
 io.use((socket, next) => {
-    // Get userId from auth (client sends this via auth.userId)
-    const userId = socket.handshake.auth.userId;
-    const token = socket.handshake.auth.token;
+    // IMPORTANT: The auth object is at socket.handshake.auth
+    const auth = socket.handshake.auth;
     
-    console.log('🔑 Auth - User ID from client:', userId);
-    console.log('🔑 Auth - Token present:', !!token);
+    console.log('🔑 Auth - Full auth object:', JSON.stringify(auth));
+    console.log('🔑 Auth - userId from auth:', auth.userId);
+    console.log('🔑 Auth - token from auth:', auth.token ? 'present' : 'not present');
     
-    // Use userId from client, or fallback to 6
+    // Get userId from auth
+    let userId = auth.userId;
+    
+    // If userId is not provided, try to get from token
+    if (!userId && auth.token) {
+        try {
+            const decoded = jwt.verify(auth.token, process.env.JWT_SECRET);
+            userId = decoded.userId;
+            console.log('🔑 Extracted userId from token:', userId);
+        } catch (err) {
+            console.log('⚠️ Token verification failed:', err.message);
+        }
+    }
+    
+    // Fallback to 6 if no userId provided
     const finalUserId = userId || 6;
     
     socket.data.userId = finalUserId;
@@ -166,12 +180,11 @@ io.on('connection', (socket) => {
                 return;
             }
             
-            // ✅ Log the actual userId being used
             console.log(`📝 Message from ${userId} in chat ${conversationId}: ${content.substring(0, 50)}...`);
             
             const message = await saveMessage({
                 conversationId,
-                senderId: userId, // ✅ Use the actual userId from socket
+                senderId: userId,
                 content,
                 messageType,
             });
