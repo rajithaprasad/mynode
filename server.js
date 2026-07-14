@@ -81,18 +81,23 @@ app.get('/test-db', async (req, res) => {
 
 // ✅ FIXED: Socket.io authentication - use the userId from client
 io.use((socket, next) => {
+    // ✅ Log the ENTIRE auth object to see what's being sent
+    console.log('🔑 Full auth object:', JSON.stringify(socket.handshake.auth));
+    console.log('🔑 Auth keys:', Object.keys(socket.handshake.auth));
+    
     const auth = socket.handshake.auth;
+    const userId = auth.userId;
+    const token = auth.token;
     
-    console.log('🔑 Auth - userId from client:', auth.userId);
-    console.log('🔑 Auth - token from client:', auth.token ? 'present' : 'not present');
+    console.log('🔑 userId from auth:', userId);
+    console.log('🔑 token from auth:', token ? 'present' : 'not present');
     
-    // ✅ Use the userId sent from client, or fallback to 6
-    const userId = auth.userId || 6;
+    const finalUserId = userId || 6;
     
-    socket.data.userId = userId;
-    socket.data.userName = `User ${userId}`;
+    socket.data.userId = finalUserId;
+    socket.data.userName = `User ${finalUserId}`;
     
-    console.log('✅ Socket authenticated as user:', userId);
+    console.log('✅ Socket authenticated as user:', finalUserId);
     next();
 });
 
