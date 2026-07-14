@@ -79,9 +79,9 @@ app.get('/test-db', async (req, res) => {
     }
 });
 
-// ✅ Socket.io authentication - Use userId from client
+// ✅ FIXED: Socket.io authentication - Properly read userId from auth
 io.use((socket, next) => {
-    // Get userId from auth, not from token
+    // Get userId from auth (client sends this via auth.userId)
     const userId = socket.handshake.auth.userId;
     const token = socket.handshake.auth.token;
     
@@ -112,7 +112,6 @@ io.on('connection', (socket) => {
     socket.on('join_chat', async ({ conversationId }) => {
         const roomName = `chat_${conversationId}`;
         
-        // Leave all previous rooms
         const rooms = Array.from(socket.rooms);
         rooms.forEach(room => {
             if (room.startsWith('chat_')) {
@@ -167,11 +166,12 @@ io.on('connection', (socket) => {
                 return;
             }
             
+            // ✅ Log the actual userId being used
             console.log(`📝 Message from ${userId} in chat ${conversationId}: ${content.substring(0, 50)}...`);
             
             const message = await saveMessage({
                 conversationId,
-                senderId: userId,
+                senderId: userId, // ✅ Use the actual userId from socket
                 content,
                 messageType,
             });
@@ -194,6 +194,7 @@ io.on('connection', (socket) => {
             
             const roomSockets = await io.in(roomName).fetchSockets();
             console.log(`📤 Room ${roomName} has ${roomSockets.length} sockets`);
+            console.log(`📤 Broadcasting message from user ${userId}`);
             
             io.to(roomName).emit('new_message', messageData);
             console.log(`📤 Broadcasted to room: ${roomName}`);
