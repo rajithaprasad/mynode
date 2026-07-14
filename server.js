@@ -1,4 +1,3 @@
-// server.js - WebSocket Server
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
@@ -80,7 +79,7 @@ app.get('/test-db', async (req, res) => {
     }
 });
 
-// ✅ Socket.io authentication
+// Socket.io authentication
 io.use((socket, next) => {
     const token = socket.handshake.auth.token;
     console.log('🔑 Auth - Token received:', token ? `${token.substring(0, 20)}...` : 'No token');
@@ -106,11 +105,11 @@ io.use((socket, next) => {
     }
 });
 
-// Store active users and their socket IDs
-const userSockets = new Map(); // userId -> socketId
-const socketUsers = new Map(); // socketId -> userId
+// Store active users
+const userSockets = new Map();
+const socketUsers = new Map();
 
-// ✅ Socket.io connection handler
+// Socket.io connection handler
 io.on('connection', (socket) => {
     const userId = socket.data.userId;
     const userName = socket.data.userName;
@@ -118,11 +117,9 @@ io.on('connection', (socket) => {
     console.log(`🔵 User connected: ${userId} (${userName})`);
     console.log(`📊 Active connections: ${io.engine.clientsCount}`);
     
-    // ✅ Store user connection
     userSockets.set(userId, socket.id);
     socketUsers.set(socket.id, userId);
     
-    // ✅ Broadcast online status to all users
     io.emit('user_online', { 
         userId, 
         userName, 
@@ -130,11 +127,11 @@ io.on('connection', (socket) => {
         timestamp: new Date().toISOString()
     });
     
-    // ✅ JOIN CHAT ROOM
+    // JOIN CHAT ROOM
     socket.on('join_chat', async ({ conversationId }) => {
         const roomName = `chat_${conversationId}`;
         
-        // ✅ Leave all previous rooms
+        // Leave all previous rooms
         const rooms = Array.from(socket.rooms);
         rooms.forEach(room => {
             if (room.startsWith('chat_')) {
@@ -143,14 +140,12 @@ io.on('connection', (socket) => {
             }
         });
         
-        // ✅ Join new room
         socket.join(roomName);
         socket.data.currentRoom = roomName;
         
         console.log(`📩 User ${userId} joined chat room: ${roomName}`);
         
         try {
-            // ✅ Load chat history
             const messages = await getChatHistory(conversationId, 50);
             socket.emit('chat_history', {
                 conversationId,
@@ -159,10 +154,8 @@ io.on('connection', (socket) => {
                 timestamp: new Date().toISOString()
             });
             
-            // ✅ Mark messages as read
             await markMessagesAsRead(conversationId, userId);
             
-            // ✅ Notify others in the room
             socket.to(roomName).emit('user_joined', {
                 userId,
                 userName,
@@ -178,7 +171,7 @@ io.on('connection', (socket) => {
         }
     });
     
-    // ✅ SEND MESSAGE
+    // SEND MESSAGE
     socket.on('send_message', async (data) => {
         try {
             const { conversationId, content, messageType = 'text' } = data;
@@ -190,7 +183,6 @@ io.on('connection', (socket) => {
             
             console.log(`📝 Message from ${userId} in chat ${conversationId}: ${content.substring(0, 50)}...`);
             
-            // ✅ Save message to database
             const message = await saveMessage({
                 conversationId,
                 senderId: userId,
@@ -198,10 +190,8 @@ io.on('connection', (socket) => {
                 messageType,
             });
             
-            // ✅ Get sender info
             const senderInfo = await getUserInfo(userId);
             
-            // ✅ Prepare message data
             const messageData = {
                 id: message.id,
                 conversationId,
@@ -214,13 +204,16 @@ io.on('connection', (socket) => {
                 is_read: 0,
             };
             
-            // ✅ Broadcast to ALL users in the room (including sender)
             const roomName = `chat_${conversationId}`;
+            
+            // Get room size for debugging
+            const roomSockets = await io.in(roomName).fetchSockets();
+            console.log(`📤 Room ${roomName} has ${roomSockets.length} sockets`);
+            
+            // Broadcast to ALL in room including sender
             io.to(roomName).emit('new_message', messageData);
+            console.log(`📤 Broadcasted to room: ${roomName}`);
             
-            console.log(`📤 Broadcasted message to room: ${roomName}`);
-            
-            // ✅ Update conversation timestamp
             await updateConversationTimestamp(conversationId);
             
         } catch (error) {
@@ -232,7 +225,7 @@ io.on('connection', (socket) => {
         }
     });
     
-    // ✅ TYPING INDICATOR
+    // TYPING INDICATOR
     socket.on('typing', ({ conversationId, isTyping }) => {
         const roomName = `chat_${conversationId}`;
         socket.to(roomName).emit('user_typing', {
@@ -243,7 +236,7 @@ io.on('connection', (socket) => {
         });
     });
     
-    // ✅ MARK MESSAGES AS READ
+    // MARK MESSAGES AS READ
     socket.on('mark_read', async ({ conversationId }) => {
         try {
             await markMessagesAsRead(conversationId, userId);
@@ -258,7 +251,7 @@ io.on('connection', (socket) => {
         }
     });
     
-    // ✅ GET UNREAD COUNT
+    // GET UNREAD COUNT
     socket.on('get_unread', async ({ conversationId }) => {
         try {
             const count = await getUnreadCount(conversationId, userId);
@@ -268,7 +261,7 @@ io.on('connection', (socket) => {
         }
     });
     
-    // ✅ DISCONNECT
+    // DISCONNECT
     socket.on('disconnect', () => {
         console.log(`🔴 User disconnected: ${userId}`);
         console.log(`📊 Active connections: ${io.engine.clientsCount}`);
@@ -285,7 +278,7 @@ io.on('connection', (socket) => {
     });
 });
 
-// ✅ DATABASE FUNCTIONS
+// DATABASE FUNCTIONS
 async function getChatHistory(conversationId, limit = 50, offset = 0) {
     const [rows] = await pool.query(
         `SELECT 
@@ -380,7 +373,7 @@ async function getUnreadCount(conversationId, userId) {
     return rows[0].count;
 }
 
-// ✅ START SERVER
+// START SERVER
 const PORT = process.env.PORT || 3000;
 
 async function startServer() {
