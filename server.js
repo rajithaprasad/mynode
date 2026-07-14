@@ -79,15 +79,22 @@ app.get('/test-db', async (req, res) => {
     }
 });
 
-// Socket.io authentication
+// ✅ Socket.io authentication - Use userId from client
 io.use((socket, next) => {
+    // Get userId from auth, not from token
+    const userId = socket.handshake.auth.userId;
     const token = socket.handshake.auth.token;
-    console.log('🔑 Auth - Token received:', token ? `${token.substring(0, 20)}...` : 'No token');
     
-    // For testing - always use user 6
-    socket.data.userId = 6;
-    socket.data.userName = 'Test User';
-    console.log('✅ Using test user: 6');
+    console.log('🔑 Auth - User ID from client:', userId);
+    console.log('🔑 Auth - Token present:', !!token);
+    
+    // Use userId from client, or fallback to 6
+    const finalUserId = userId || 6;
+    
+    socket.data.userId = finalUserId;
+    socket.data.userName = `User ${finalUserId}`;
+    
+    console.log('✅ Socket authenticated as user:', finalUserId);
     next();
 });
 
@@ -101,7 +108,7 @@ io.on('connection', (socket) => {
     console.log(`🔵 User connected: ${userId} (${userName})`);
     console.log(`📊 Active connections: ${io.engine.clientsCount}`);
     
-    // ✅ JOIN CHAT ROOM
+    // JOIN CHAT ROOM
     socket.on('join_chat', async ({ conversationId }) => {
         const roomName = `chat_${conversationId}`;
         
@@ -114,20 +121,17 @@ io.on('connection', (socket) => {
             }
         });
         
-        // Join new room
         socket.join(roomName);
         socket.data.currentRoom = roomName;
         
         console.log(`📩 User ${userId} joined chat room: ${roomName}`);
         
-        // Store room membership
         if (!roomMembers.has(roomName)) {
             roomMembers.set(roomName, new Set());
         }
         roomMembers.get(roomName).add(userId);
         
         try {
-            // Load chat history
             const messages = await getChatHistory(conversationId, 50);
             socket.emit('chat_history', {
                 conversationId,
@@ -136,10 +140,8 @@ io.on('connection', (socket) => {
                 timestamp: new Date().toISOString()
             });
             
-            // Mark messages as read
             await markMessagesAsRead(conversationId, userId);
             
-            // Notify others in the room
             socket.to(roomName).emit('user_joined', {
                 userId,
                 userName,
@@ -155,7 +157,7 @@ io.on('connection', (socket) => {
         }
     });
     
-    // ✅ SEND MESSAGE
+    // SEND MESSAGE
     socket.on('send_message', async (data) => {
         try {
             const { conversationId, content, messageType = 'text' } = data;
@@ -167,7 +169,6 @@ io.on('connection', (socket) => {
             
             console.log(`📝 Message from ${userId} in chat ${conversationId}: ${content.substring(0, 50)}...`);
             
-            // Save message to database
             const message = await saveMessage({
                 conversationId,
                 senderId: userId,
@@ -175,10 +176,8 @@ io.on('connection', (socket) => {
                 messageType,
             });
             
-            // Get sender info
             const senderInfo = await getUserInfo(userId);
             
-            // Prepare message data
             const messageData = {
                 id: message.id,
                 conversationId,
@@ -193,15 +192,12 @@ io.on('connection', (socket) => {
             
             const roomName = `chat_${conversationId}`;
             
-            // ✅ IMPORTANT: Get room size
             const roomSockets = await io.in(roomName).fetchSockets();
             console.log(`📤 Room ${roomName} has ${roomSockets.length} sockets`);
             
-            // ✅ Broadcast to ALL including sender
             io.to(roomName).emit('new_message', messageData);
             console.log(`📤 Broadcasted to room: ${roomName}`);
             
-            // Update conversation timestamp
             await updateConversationTimestamp(conversationId);
             
         } catch (error) {
@@ -213,7 +209,7 @@ io.on('connection', (socket) => {
         }
     });
     
-    // ✅ TYPING INDICATOR
+    // TYPING INDICATOR
     socket.on('typing', ({ conversationId, isTyping }) => {
         const roomName = `chat_${conversationId}`;
         socket.to(roomName).emit('user_typing', {
@@ -224,7 +220,7 @@ io.on('connection', (socket) => {
         });
     });
     
-    // ✅ MARK MESSAGES AS READ
+    // MARK MESSAGES AS READ
     socket.on('mark_read', async ({ conversationId }) => {
         try {
             await markMessagesAsRead(conversationId, userId);
@@ -239,12 +235,11 @@ io.on('connection', (socket) => {
         }
     });
     
-    // ✅ DISCONNECT
+    // DISCONNECT
     socket.on('disconnect', () => {
         console.log(`🔴 User disconnected: ${userId}`);
         console.log(`📊 Active connections: ${io.engine.clientsCount}`);
         
-        // Remove from room members
         roomMembers.forEach((members, roomName) => {
             if (members.has(userId)) {
                 members.delete(userId);
