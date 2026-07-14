@@ -79,36 +79,20 @@ app.get('/test-db', async (req, res) => {
     }
 });
 
-// ✅ FIXED: Socket.io authentication - CORRECTLY read userId from auth
+// ✅ FIXED: Socket.io authentication - use the userId from client
 io.use((socket, next) => {
-    // IMPORTANT: The auth object is at socket.handshake.auth
     const auth = socket.handshake.auth;
     
-    console.log('🔑 Auth - Full auth object:', JSON.stringify(auth));
-    console.log('🔑 Auth - userId from auth:', auth.userId);
-    console.log('🔑 Auth - token from auth:', auth.token ? 'present' : 'not present');
+    console.log('🔑 Auth - userId from client:', auth.userId);
+    console.log('🔑 Auth - token from client:', auth.token ? 'present' : 'not present');
     
-    // Get userId from auth
-    let userId = auth.userId;
+    // ✅ Use the userId sent from client, or fallback to 6
+    const userId = auth.userId || 6;
     
-    // If userId is not provided, try to get from token
-    if (!userId && auth.token) {
-        try {
-            const decoded = jwt.verify(auth.token, process.env.JWT_SECRET);
-            userId = decoded.userId;
-            console.log('🔑 Extracted userId from token:', userId);
-        } catch (err) {
-            console.log('⚠️ Token verification failed:', err.message);
-        }
-    }
+    socket.data.userId = userId;
+    socket.data.userName = `User ${userId}`;
     
-    // Fallback to 6 if no userId provided
-    const finalUserId = userId || 6;
-    
-    socket.data.userId = finalUserId;
-    socket.data.userName = `User ${finalUserId}`;
-    
-    console.log('✅ Socket authenticated as user:', finalUserId);
+    console.log('✅ Socket authenticated as user:', userId);
     next();
 });
 
@@ -116,6 +100,7 @@ io.use((socket, next) => {
 const roomMembers = new Map();
 
 io.on('connection', (socket) => {
+    // ✅ Get userId from socket data (set in auth)
     const userId = socket.data.userId;
     const userName = socket.data.userName;
     
@@ -180,22 +165,26 @@ io.on('connection', (socket) => {
                 return;
             }
             
-            console.log(`📝 Message from ${userId} in chat ${conversationId}: ${content.substring(0, 50)}...`);
+            // ✅ Use the userId from socket data
+            const senderId = socket.data.userId;
+            
+            console.log(`📝 Message from ${senderId} in chat ${conversationId}: ${content.substring(0, 50)}...`);
+            console.log(`🔑 Sender ID from socket: ${senderId}`);
             
             const message = await saveMessage({
                 conversationId,
-                senderId: userId,
+                senderId: senderId,
                 content,
                 messageType,
             });
             
-            const senderInfo = await getUserInfo(userId);
+            const senderInfo = await getUserInfo(senderId);
             
             const messageData = {
                 id: message.id,
                 conversationId,
-                senderId: userId,
-                senderName: senderInfo?.name || userName,
+                senderId: senderId,
+                senderName: senderInfo?.name || `User ${senderId}`,
                 senderImage: senderInfo?.profile_image || null,
                 content,
                 messageType,
@@ -207,8 +196,9 @@ io.on('connection', (socket) => {
             
             const roomSockets = await io.in(roomName).fetchSockets();
             console.log(`📤 Room ${roomName} has ${roomSockets.length} sockets`);
-            console.log(`📤 Broadcasting message from user ${userId}`);
+            console.log(`📤 Broadcasting message from user ${senderId}`);
             
+            // ✅ Broadcast to ALL in room including sender
             io.to(roomName).emit('new_message', messageData);
             console.log(`📤 Broadcasted to room: ${roomName}`);
             
