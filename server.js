@@ -79,25 +79,26 @@ app.get('/test-db', async (req, res) => {
     }
 });
 
-// ✅ FIXED: Socket.io authentication - use the userId from client
+// ✅ FIXED: Socket.io authentication with DEBUG logging
 io.use((socket, next) => {
-    // ✅ Log the ENTIRE auth object to see what's being sent
-    console.log('🔑 Full auth object:', JSON.stringify(socket.handshake.auth));
-    console.log('🔑 Auth keys:', Object.keys(socket.handshake.auth));
-    
+    // Get auth from handshake
     const auth = socket.handshake.auth;
-    const userId = auth.userId;
-    const token = auth.token;
     
-    console.log('🔑 userId from auth:', userId);
-    console.log('🔑 token from auth:', token ? 'present' : 'not present');
+    // DEBUG: Log everything
+    console.log('========================================');
+    console.log('🔑 Full auth object:', JSON.stringify(auth));
+    console.log('🔑 Auth keys:', Object.keys(auth));
+    console.log('🔑 auth.userId:', auth.userId);
+    console.log('🔑 auth.token:', auth.token ? 'present' : 'not present');
+    console.log('========================================');
     
-    const finalUserId = userId || 6;
+    // Use userId from auth, or fallback to 6
+    const userId = auth.userId || 6;
     
-    socket.data.userId = finalUserId;
-    socket.data.userName = `User ${finalUserId}`;
+    socket.data.userId = userId;
+    socket.data.userName = `User ${userId}`;
     
-    console.log('✅ Socket authenticated as user:', finalUserId);
+    console.log(`✅ Socket authenticated as user: ${userId}`);
     next();
 });
 
@@ -105,7 +106,6 @@ io.use((socket, next) => {
 const roomMembers = new Map();
 
 io.on('connection', (socket) => {
-    // ✅ Get userId from socket data (set in auth)
     const userId = socket.data.userId;
     const userName = socket.data.userName;
     
@@ -170,11 +170,10 @@ io.on('connection', (socket) => {
                 return;
             }
             
-            // ✅ Use the userId from socket data
+            // Use userId from socket data
             const senderId = socket.data.userId;
             
             console.log(`📝 Message from ${senderId} in chat ${conversationId}: ${content.substring(0, 50)}...`);
-            console.log(`🔑 Sender ID from socket: ${senderId}`);
             
             const message = await saveMessage({
                 conversationId,
@@ -201,9 +200,7 @@ io.on('connection', (socket) => {
             
             const roomSockets = await io.in(roomName).fetchSockets();
             console.log(`📤 Room ${roomName} has ${roomSockets.length} sockets`);
-            console.log(`📤 Broadcasting message from user ${senderId}`);
             
-            // ✅ Broadcast to ALL in room including sender
             io.to(roomName).emit('new_message', messageData);
             console.log(`📤 Broadcasted to room: ${roomName}`);
             
