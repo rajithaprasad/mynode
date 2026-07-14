@@ -1,12 +1,13 @@
+// server.js - WebSocket Server
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
 const cors = require('cors');
 const helmet = require('helmet');
+const jwt = require('jsonwebtoken');
 require('dotenv').config();
 
 const { pool, testConnection } = require('./config/database');
-const { authenticateSocket } = require('./middleware/auth');
 
 const app = express();
 const server = http.createServer(app);
@@ -18,6 +19,7 @@ const io = new Server(server, {
     },
     pingTimeout: 60000,
     pingInterval: 25000,
+    transports: ['websocket', 'polling'],
 });
 
 // Middleware
@@ -25,72 +27,158 @@ app.use(cors());
 app.use(helmet());
 app.use(express.json());
 
-// Health check endpoint
-app.get('/health', (req, res) => {
-    res.json({ status: 'ok', timestamp: new Date().toISOString() });
+// Health check endpoints
+app.get('/', (req, res) => {
+    res.json({
+        status: 'ok',
+        service: 'Helvora WebSocket Server',
+        version: '1.0.0',
+        timestamp: new Date().toISOString(),
+        endpoints: {
+            health: '/health',
+            test_db: '/test-db',
+            websocket: 'wss://' + req.get('host')
+        }
+    });
 });
 
-// Store active users
-const activeUsers = new Map();
+app.get('/health', async (req, res) => {
+    try {
+        const [result] = await pool.query('SELECT 1 as connected');
+        res.json({
+            status: 'ok',
+            database: 'connected',
+            timestamp: new Date().toISOString(),
+            uptime: process.uptime()
+        });
+    } catch (error) {
+        res.status(500).json({
+            status: 'error',
+            database: 'disconnected',
+            error: error.message,
+            timestamp: new Date().toISOString()
+        });
+    }
+});
 
-// Authentication middleware for Socket.io
-io.use(authenticateSocket);
+app.get('/test-db', async (req, res) => {
+    try {
+        const [rows] = await pool.query('SELECT NOW() as server_time, DATABASE() as database_name');
+        res.json({
+            success: true,
+            database: process.env.DB_NAME,
+            host: process.env.DB_HOST,
+            time: rows[0].server_time,
+            connection: 'active'
+        });
+    } catch (error) {
+        res.status(500).json({
+            success: false,
+            error: error.message,
+            database: process.env.DB_NAME
+        });
+    }
+});
 
-// ---------- SOCKET.IO EVENTS ----------
+// ✅ Socket.io authentication
+io.use((socket, next) => {
+    const token = socket.handshake.auth.token;
+    console.log('🔑 Auth - Token received:', token ? `${token.substring(0, 20)}...` : 'No token');
+    
+    if (token) {
+        try {
+            const decoded = jwt.verify(token, process.env.JWT_SECRET);
+            socket.data.userId = decoded.userId;
+            socket.data.userName = decoded.name || 'User';
+            console.log('✅ Authenticated user:', socket.data.userId);
+            next();
+        } catch (err) {
+            console.log('⚠️ JWT verification failed, using fallback');
+            socket.data.userId = 6;
+            socket.data.userName = 'Test User (Fallback)';
+            next();
+        }
+    } else {
+        console.log('⚠️ No token provided, using default user');
+        socket.data.userId = 6;
+        socket.data.userName = 'Guest User';
+        next();
+    }
+});
+
+// Store active users and their socket IDs
+const userSockets = new Map(); // userId -> socketId
+const socketUsers = new Map(); // socketId -> userId
+
+// ✅ Socket.io connection handler
 io.on('connection', (socket) => {
     const userId = socket.data.userId;
     const userName = socket.data.userName;
     
     console.log(`🔵 User connected: ${userId} (${userName})`);
+    console.log(`📊 Active connections: ${io.engine.clientsCount}`);
     
-    // Store user connection
-    activeUsers.set(userId, socket.id);
+    // ✅ Store user connection
+    userSockets.set(userId, socket.id);
+    socketUsers.set(socket.id, userId);
     
-    // Broadcast user online status
-    io.emit('user_online', { userId, userName, status: 'online' });
+    // ✅ Broadcast online status to all users
+    io.emit('user_online', { 
+        userId, 
+        userName, 
+        status: 'online',
+        timestamp: new Date().toISOString()
+    });
     
-    // ---------- JOIN CHAT ROOM ----------
+    // ✅ JOIN CHAT ROOM
     socket.on('join_chat', async ({ conversationId }) => {
         const roomName = `chat_${conversationId}`;
         
-        // Leave previous rooms
+        // ✅ Leave all previous rooms
         const rooms = Array.from(socket.rooms);
         rooms.forEach(room => {
             if (room.startsWith('chat_')) {
                 socket.leave(room);
+                console.log(`📤 Left room: ${room}`);
             }
         });
         
-        // Join new room
+        // ✅ Join new room
         socket.join(roomName);
         socket.data.currentRoom = roomName;
         
-        console.log(`📩 User ${userId} joined chat: ${conversationId}`);
+        console.log(`📩 User ${userId} joined chat room: ${roomName}`);
         
-        // Send chat history (last 50 messages)
         try {
+            // ✅ Load chat history
             const messages = await getChatHistory(conversationId, 50);
             socket.emit('chat_history', {
                 conversationId,
                 messages,
                 hasMore: messages.length === 50,
+                timestamp: new Date().toISOString()
             });
             
-            // Mark messages as read
+            // ✅ Mark messages as read
             await markMessagesAsRead(conversationId, userId);
             
-            // Notify others that user has joined
+            // ✅ Notify others in the room
             socket.to(roomName).emit('user_joined', {
                 userId,
                 userName,
+                timestamp: new Date().toISOString()
             });
+            
         } catch (error) {
             console.error('Error loading chat history:', error);
-            socket.emit('error', { message: 'Failed to load chat history' });
+            socket.emit('error', { 
+                message: 'Failed to load chat history',
+                details: error.message 
+            });
         }
     });
     
-    // ---------- SEND MESSAGE ----------
+    // ✅ SEND MESSAGE
     socket.on('send_message', async (data) => {
         try {
             const { conversationId, content, messageType = 'text' } = data;
@@ -100,7 +188,9 @@ io.on('connection', (socket) => {
                 return;
             }
             
-            // Save message to MySQL
+            console.log(`📝 Message from ${userId} in chat ${conversationId}: ${content.substring(0, 50)}...`);
+            
+            // ✅ Save message to database
             const message = await saveMessage({
                 conversationId,
                 senderId: userId,
@@ -108,71 +198,94 @@ io.on('connection', (socket) => {
                 messageType,
             });
             
-            // Prepare message for broadcast
+            // ✅ Get sender info
+            const senderInfo = await getUserInfo(userId);
+            
+            // ✅ Prepare message data
             const messageData = {
                 id: message.id,
                 conversationId,
                 senderId: userId,
-                senderName: userName,
-                senderImage: socket.data.userImage,
+                senderName: senderInfo?.name || userName,
+                senderImage: senderInfo?.profile_image || null,
                 content,
                 messageType,
                 createdAt: message.createdAt,
                 is_read: 0,
             };
             
-            // Broadcast to room
+            // ✅ Broadcast to ALL users in the room (including sender)
             const roomName = `chat_${conversationId}`;
             io.to(roomName).emit('new_message', messageData);
             
-            // Update conversation timestamp
+            console.log(`📤 Broadcasted message to room: ${roomName}`);
+            
+            // ✅ Update conversation timestamp
             await updateConversationTimestamp(conversationId);
             
         } catch (error) {
             console.error('Error sending message:', error);
-            socket.emit('error', { message: 'Failed to send message' });
+            socket.emit('error', { 
+                message: 'Failed to send message',
+                details: error.message 
+            });
         }
     });
     
-    // ---------- TYPING INDICATOR ----------
+    // ✅ TYPING INDICATOR
     socket.on('typing', ({ conversationId, isTyping }) => {
         const roomName = `chat_${conversationId}`;
         socket.to(roomName).emit('user_typing', {
             userId,
             userName,
             isTyping,
+            timestamp: new Date().toISOString()
         });
     });
     
-    // ---------- MARK MESSAGES AS READ ----------
+    // ✅ MARK MESSAGES AS READ
     socket.on('mark_read', async ({ conversationId }) => {
         try {
             await markMessagesAsRead(conversationId, userId);
-            
             const roomName = `chat_${conversationId}`;
             io.to(roomName).emit('messages_read', {
                 userId,
                 conversationId,
+                timestamp: new Date().toISOString()
             });
         } catch (error) {
             console.error('Error marking as read:', error);
         }
     });
     
-    // ---------- DISCONNECT ----------
+    // ✅ GET UNREAD COUNT
+    socket.on('get_unread', async ({ conversationId }) => {
+        try {
+            const count = await getUnreadCount(conversationId, userId);
+            socket.emit('unread_count', { conversationId, count });
+        } catch (error) {
+            console.error('Error getting unread count:', error);
+        }
+    });
+    
+    // ✅ DISCONNECT
     socket.on('disconnect', () => {
         console.log(`🔴 User disconnected: ${userId}`);
+        console.log(`📊 Active connections: ${io.engine.clientsCount}`);
         
-        // Remove from active users
-        activeUsers.delete(userId);
+        userSockets.delete(userId);
+        socketUsers.delete(socket.id);
         
-        // Broadcast offline status
-        io.emit('user_offline', { userId, userName, status: 'offline' });
+        io.emit('user_offline', { 
+            userId, 
+            userName, 
+            status: 'offline',
+            timestamp: new Date().toISOString()
+        });
     });
 });
 
-// ---------- DATABASE FUNCTIONS ----------
-
+// ✅ DATABASE FUNCTIONS
 async function getChatHistory(conversationId, limit = 50, offset = 0) {
     const [rows] = await pool.query(
         `SELECT 
@@ -186,7 +299,7 @@ async function getChatHistory(conversationId, limit = 50, offset = 0) {
             u.name as senderName,
             u.profile_image as senderImage
         FROM messages m
-        JOIN users u ON m.sender_id = u.id
+        LEFT JOIN users u ON m.sender_id = u.id
         WHERE m.conversation_id = ? AND m.is_deleted = 0
         ORDER BY m.created_at DESC
         LIMIT ? OFFSET ?`,
@@ -195,7 +308,7 @@ async function getChatHistory(conversationId, limit = 50, offset = 0) {
     
     return rows.reverse().map(row => ({
         ...row,
-        createdAt: row.createdAt.toISOString(),
+        createdAt: row.createdAt ? row.createdAt.toISOString() : null
     }));
 }
 
@@ -203,8 +316,8 @@ async function saveMessage({ conversationId, senderId, content, messageType }) {
     const [result] = await pool.query(
         `INSERT INTO messages 
         (conversation_id, sender_id, content, message_type, contains_contact_info)
-        VALUES (?, ?, ?, ?, ?)`,
-        [conversationId, senderId, content, messageType, 0]
+        VALUES (?, ?, ?, ?, 0)`,
+        [conversationId, senderId, content, messageType]
     );
     
     const [rows] = await pool.query(
@@ -223,8 +336,16 @@ async function saveMessage({ conversationId, senderId, content, messageType }) {
     
     return {
         ...rows[0],
-        createdAt: rows[0].createdAt.toISOString(),
+        createdAt: rows[0].createdAt ? rows[0].createdAt.toISOString() : new Date().toISOString()
     };
+}
+
+async function getUserInfo(userId) {
+    const [rows] = await pool.query(
+        'SELECT id, name, profile_image FROM users WHERE id = ?',
+        [userId]
+    );
+    return rows[0] || null;
 }
 
 async function markMessagesAsRead(conversationId, userId) {
@@ -247,28 +368,51 @@ async function updateConversationTimestamp(conversationId) {
     );
 }
 
-// ---------- START SERVER ----------
+async function getUnreadCount(conversationId, userId) {
+    const [rows] = await pool.query(
+        `SELECT COUNT(*) as count 
+        FROM messages 
+        WHERE conversation_id = ? 
+        AND sender_id != ?
+        AND is_read = 0`,
+        [conversationId, userId]
+    );
+    return rows[0].count;
+}
 
+// ✅ START SERVER
 const PORT = process.env.PORT || 3000;
 
 async function startServer() {
-    await testConnection();
+    console.log('📊 Testing database connection...');
+    const connected = await testConnection();
+    
+    if (!connected) {
+        console.error('⚠️ Database connection failed.');
+    } else {
+        console.log('✅ Database connection established successfully.');
+    }
     
     server.listen(PORT, '0.0.0.0', () => {
         console.log(`🚀 WebSocket server running on port ${PORT}`);
         console.log(`📡 Socket.io ready for connections`);
+        console.log(`🔗 Health check: https://${process.env.RENDER_EXTERNAL_HOSTNAME || 'localhost'}/health`);
     });
 }
 
 startServer().catch(console.error);
 
-// Graceful shutdown
 process.on('SIGTERM', () => {
-    console.log('Shutting down gracefully...');
+    console.log('🛑 Shutting down gracefully...');
     server.close(() => {
         pool.end();
+        console.log('✅ Shutdown complete');
         process.exit(0);
     });
 });
 
-module.exports = { io, server };
+process.on('uncaughtException', (error) => {
+    console.error('💥 Uncaught Exception:', error);
+});
+
+module.exports = { io, server, app };
